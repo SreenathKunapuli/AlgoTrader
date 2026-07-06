@@ -32,6 +32,7 @@ from .risk.risk_manager import OrderIntent, Rejection, RiskManager
 from .risk.sizing import size_position
 from .risk.state import PortfolioState
 from .signals.ensemble import Ensemble
+from .signals.health import SignalHealthTracker
 
 log = structlog.get_logger()
 
@@ -71,6 +72,7 @@ class Engine:
         self.bars_5m: dict[str, deque[Bar]] = defaultdict(lambda: deque(maxlen=MAX_5M_BARS))
         self._pending_1m: dict[str, list[Bar]] = defaultdict(list)
         self._last_rebalance = datetime.min.replace(tzinfo=UTC)
+        self.health = SignalHealthTracker(repo, list(ensemble.signals))
         self._paused_stale = False
 
     # ---------------- data path ---------------- #
@@ -304,7 +306,10 @@ class Engine:
                 last_day = now.date()
                 self.state.day_start_equity = self.state.equity
                 self.repo.update_state(day_start_equity=self.state.equity)
-                log.info("day.roll", equity=self.state.equity)
+                # shadow evaluation: refresh per-signal health multipliers
+                self.ensemble.health_multipliers = self.health.evaluate(now)
+                log.info("day.roll", equity=self.state.equity,
+                         health=self.ensemble.health_multipliers)
 
 
 def pubsub_emit(ps: PubSub) -> Any:

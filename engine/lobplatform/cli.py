@@ -109,6 +109,8 @@ def main() -> None:
     sub.add_parser("flatten", help="alias for halt (cancel+flatten)")
     trainp = sub.add_parser("train-signal", help="walk-forward train lob_flow")
     trainp.add_argument("--days", type=int, default=30)
+    evalp = sub.add_parser("evaluate-signal", help="§5.9 cost-aware walk-forward eval")
+    evalp.add_argument("--days", type=int, default=30)
     args = p.parse_args()
 
     if args.cmd == "run":
@@ -129,6 +131,17 @@ def main() -> None:
         from .train_signal import run_training
 
         run_training(days=args.days)
+    elif args.cmd == "evaluate-signal":
+        from .data.history import fetch_minute_bars
+        from .evaluate_signal import evaluate
+        from .train_signal import to_5min
+
+        s = get_settings()
+        hist = fetch_minute_bars(s.alpaca_api_key, s.alpaca_secret_key,
+                                 TIERS[Tier.MEDIUM].universe, args.days)
+        bars5 = {sym: to_5min(b) for sym, b in hist.items()}
+        m = evaluate(bars5, s.models_dir, arch=s.lob_flow_arch)
+        print(f"gate={'PASS' if m.passes_gate else 'FAIL'} {m.as_dict()}")
 
 
 if __name__ == "__main__":
