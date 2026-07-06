@@ -16,3 +16,8 @@ node_modules/
 .ruff_cache/
 web/out/
 data_holdout/
+node_modules/
+.next/
+test-results/
+playwright-report/
+lobplatform.db
