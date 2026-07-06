@@ -84,6 +84,7 @@ class EngineState(Base):
     peak_equity: Mapped[float] = mapped_column(Float, default=0.0)
     heartbeat_ts: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_data_ts: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    positions_json: Mapped[list] = mapped_column(JSON, default=list)  # type: ignore[type-arg]
 
 
 class RiskRejection(Base):

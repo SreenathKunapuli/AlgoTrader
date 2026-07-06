@@ -46,6 +46,9 @@ extend-exclude = ["research", "web"]
 [tool.ruff.lint]
 select = ["E", "F", "I", "W", "UP", "B"]
 
+[tool.ruff.lint.flake8-bugbear]
+extend-immutable-calls = ["fastapi.Depends", "fastapi.Query"]
+
 [tool.mypy]
 python_version = "3.11"
 strict = true

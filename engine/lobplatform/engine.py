@@ -261,8 +261,14 @@ class Engine:
             await asyncio.sleep(self.settings.heartbeat_interval_s)
             now = datetime.now(UTC)
             self.state.peak_equity = max(self.state.peak_equity, self.state.equity)
+            pos_payload = [{"symbol": p.symbol, "qty": p.qty, "entry": p.entry_price,
+                            "mark": p.mark, "upnl": round(p.unrealized_pnl, 2),
+                            "stop": p.stop_price,
+                            "age_s": (now - p.entry_ts).total_seconds() if p.entry_ts else None}
+                           for p in self.state.positions.values()]
             self.repo.update_state(heartbeat_ts=now, last_data_ts=self.state.last_data_ts,
-                                   peak_equity=self.state.peak_equity)
+                                   peak_equity=self.state.peak_equity,
+                                   positions_json=pos_payload)
             self.repo.add_equity_snapshot(now, self.state.equity, self.state.cash,
                                           self.state.gross_exposure)
             await self.pubsub.publish("equity", {

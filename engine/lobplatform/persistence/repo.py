@@ -30,7 +30,13 @@ from .models import (
 class Repo:
     def __init__(self, database_url: str) -> None:
         connect_args = {"check_same_thread": False} if database_url.startswith("sqlite") else {}
-        self._engine = create_engine(database_url, connect_args=connect_args, future=True)
+        kwargs: dict[str, Any] = {"connect_args": connect_args, "future": True}
+        if ":memory:" in database_url:
+            # one shared connection, or every pool checkout sees an empty DB
+            from sqlalchemy.pool import StaticPool
+
+            kwargs["poolclass"] = StaticPool
+        self._engine = create_engine(database_url, **kwargs)
         self._session_factory = sessionmaker(self._engine, expire_on_commit=False)
         Base.metadata.create_all(self._engine)
 
