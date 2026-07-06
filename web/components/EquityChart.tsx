@@ -17,6 +17,7 @@ export default function EquityChart({ liveEquity }: { liveEquity?: { ts: string;
   const holder = useRef<HTMLDivElement>(null);
   const chart = useRef<IChartApi | null>(null);
   const series = useRef<ISeriesApi<"Line"> | null>(null);
+  const lastTime = useRef<number>(0); // newest plotted ts; guards out-of-order updates
   const [range, setRange] = useState<Range>("1d");
 
   useEffect(() => {
@@ -40,24 +41,25 @@ export default function EquityChart({ liveEquity }: { liveEquity?: { ts: string;
 
   useEffect(() => {
     api<{ ts: string; equity: number }[]>(`/equity-curve?range=${range}`)
-      .then((pts) =>
-        series.current?.setData(
-          pts.map((p) => ({
-            time: (new Date(p.ts).getTime() / 1000) as UTCTimestamp,
-            value: p.equity,
-          })) as LineData[]
-        )
-      )
+      .then((pts) => {
+        // dedupe on second granularity and enforce ascending order
+        const byTime = new Map<number, number>();
+        for (const p of pts) byTime.set(Math.floor(new Date(p.ts).getTime() / 1000), p.equity);
+        const data = Array.from(byTime.entries())
+          .sort((a, b) => a[0] - b[0])
+          .map(([t, v]) => ({ time: t as UTCTimestamp, value: v }));
+        series.current?.setData(data as LineData[]);
+        lastTime.current = data.length ? (data[data.length - 1].time as number) : 0;
+      })
       .catch(() => {});
   }, [range]);
 
   useEffect(() => {
-    if (liveEquity && series.current) {
-      series.current.update({
-        time: (new Date(liveEquity.ts).getTime() / 1000) as UTCTimestamp,
-        value: liveEquity.equity,
-      });
-    }
+    if (!liveEquity || !series.current) return;
+    const t = Math.floor(new Date(liveEquity.ts).getTime() / 1000);
+    if (t < lastTime.current) return; // stale tick from a load/stream race
+    lastTime.current = t;
+    series.current.update({ time: t as UTCTimestamp, value: liveEquity.equity });
   }, [liveEquity]);
 
   return (
