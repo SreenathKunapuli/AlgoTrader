@@ -85,7 +85,7 @@ async def _run(tier_name: str) -> None:
     engine.warmup(history)
 
     stream = MarketStream(s.alpaca_api_key, s.alpaca_secret_key, tier.universe,
-                          engine.on_trade, engine.on_quote)
+                          engine.on_trade, engine.on_quote, engine.on_stream_bar)
     log.info("engine.start", tier=tier_name, universe=len(tier.universe))
     await asyncio.gather(
         stream.run_forever(),

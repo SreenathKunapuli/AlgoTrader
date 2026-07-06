@@ -71,6 +71,13 @@ class Engine:
         self.bars_1m: dict[str, deque[Bar]] = defaultdict(lambda: deque(maxlen=12000))
         self.bars_5m: dict[str, deque[Bar]] = defaultdict(lambda: deque(maxlen=MAX_5M_BARS))
         self._pending_1m: dict[str, list[Bar]] = defaultdict(list)
+        # microstructure accumulators drained into each incoming stream bar
+        self._spread_acc: dict[str, list[float]] = defaultdict(list)
+        self._qimb_acc: dict[str, list[float]] = defaultdict(list)
+        self._flow_acc: dict[str, float] = defaultdict(float)
+        self._flow_tot: dict[str, float] = defaultdict(float)
+        self._last_px: dict[str, float] = {}
+        self._last_quote: dict[str, tuple[float, float]] = {}
         self._last_rebalance = datetime.min.replace(tzinfo=UTC)
         self.health = SignalHealthTracker(repo, list(ensemble.signals))
         self._paused_stale = False
@@ -92,9 +99,18 @@ class Engine:
 
     async def on_trade(self, symbol: str, ts: datetime, price: float, size: int) -> None:
         self.state.last_data_ts = datetime.now(UTC)
-        done = self.builder.on_trade(symbol, ts, price, size)
-        if done:
-            await self.on_minute_bar(done)
+        bid, ask = self._last_quote.get(symbol, (0.0, 0.0))
+        last = self._last_px.get(symbol)
+        sign = 0
+        if ask > 0 and price >= ask:
+            sign = 1
+        elif bid > 0 and price <= bid:
+            sign = -1
+        elif last is not None and price != last:
+            sign = 1 if price > last else -1
+        self._flow_acc[symbol] += sign * size
+        self._flow_tot[symbol] += size
+        self._last_px[symbol] = price
         pos = self.state.positions.get(symbol)
         if pos:
             pos.mark = price
@@ -102,9 +118,34 @@ class Engine:
     async def on_quote(self, symbol: str, ts: datetime, bid: float, bid_sz: int,
                        ask: float, ask_sz: int) -> None:
         self.state.last_data_ts = datetime.now(UTC)
-        done = self.builder.on_quote(symbol, ts, bid, bid_sz, ask, ask_sz)
-        if done:
-            await self.on_minute_bar(done)
+        self._last_quote[symbol] = (bid, ask)
+        if bid > 0 and ask > bid:
+            self._spread_acc[symbol].append(ask - bid)
+        denom = bid_sz + ask_sz
+        if denom > 0:
+            self._qimb_acc[symbol].append((bid_sz - ask_sz) / denom)
+
+    async def on_stream_bar(self, symbol: str, ts: datetime, o: float, h: float,
+                            low: float, c: float, vol: int, vwap: float,
+                            tcount: int) -> None:
+        """Official 1-min bar from Alpaca, enriched with accumulated
+        quote/trade microstructure (zeros where we hold no subscription)."""
+        self.state.last_data_ts = datetime.now(UTC)
+        spreads = self._spread_acc.pop(symbol, [])
+        qimbs = self._qimb_acc.pop(symbol, [])
+        flow = self._flow_acc.pop(symbol, 0.0)
+        tot = self._flow_tot.pop(symbol, 0.0)
+        bar = Bar(
+            symbol=symbol, ts=ts, interval_s=60, open=o, high=h, low=low,
+            close=c, volume=vol, vwap=vwap, trade_count=tcount,
+            mean_spread=sum(spreads) / len(spreads) if spreads else 0.0,
+            mean_quote_imbalance=sum(qimbs) / len(qimbs) if qimbs else 0.0,
+            flow_imbalance=flow / tot if tot > 0 else 0.0,
+        )
+        pos = self.state.positions.get(symbol)
+        if pos:
+            pos.mark = c
+        await self.on_minute_bar(bar)
 
     async def on_minute_bar(self, bar: Bar) -> None:
         """Finalized 1-min bar: cache, aggregate to 5-min, maybe act."""
