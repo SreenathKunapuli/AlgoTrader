@@ -36,6 +36,10 @@ def _repo() -> Repo:
 
 
 async def _run(tier_name: str) -> None:
+    import atexit
+    import os
+    from pathlib import Path
+
     from .data.alpaca_stream import MarketStream
     from .data.history import fetch_minute_bars
     from .engine import Engine
@@ -49,6 +53,22 @@ async def _run(tier_name: str) -> None:
     from .signals.lob_flow import LobFlowSignal
     from .signals.mean_reversion import MeanReversionSignal
     from .signals.momentum import MomentumSignal
+
+    # Alpaca allows ONE data websocket per account: two engines silently kick
+    # each other off the stream (observed live 2026-07-07). Refuse dual launch.
+    lock = Path("lobengine.pid")
+    if lock.exists():
+        try:
+            old_pid = int(lock.read_text().strip())
+            os.kill(old_pid, 0)  # raises if not running
+            print(f"FATAL: another engine is already running (pid {old_pid}). "
+                  "Alpaca allows one data connection — two engines starve each other. "
+                  "Stop it first (Ctrl-C or `kill`).")
+            sys.exit(1)
+        except (ProcessLookupError, ValueError):
+            pass  # stale lockfile
+    lock.write_text(str(os.getpid()))
+    atexit.register(lambda: lock.unlink(missing_ok=True))
 
     s = get_settings()
     if s.trading_mode != "paper":
