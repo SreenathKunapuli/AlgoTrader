@@ -298,9 +298,18 @@ class Engine:
                     await self._exit_position(sym, "eod")
 
     async def heartbeat(self) -> None:
+        last_beat = datetime.now(UTC)
         while True:
             await asyncio.sleep(self.settings.heartbeat_interval_s)
             now = datetime.now(UTC)
+            gap = (now - last_beat).total_seconds()
+            last_beat = now
+            if gap > 120:  # machine slept: local mirror is suspect
+                log.warning("wake.detected", slept_s=int(gap))
+                try:
+                    await self.om.reconcile_state()
+                except Exception as exc:
+                    log.error("wake.reconcile_failed", error=str(exc))
             self.state.peak_equity = max(self.state.peak_equity, self.state.equity)
             pos_payload = [{"symbol": p.symbol, "qty": p.qty, "entry": p.entry_price,
                             "mark": p.mark, "upnl": round(p.unrealized_pnl, 2),

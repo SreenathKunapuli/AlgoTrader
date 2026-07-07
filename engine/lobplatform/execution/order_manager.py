@@ -119,6 +119,13 @@ class OrderManager:
             if not closing:  # scale-in: blend entry
                 pos.entry_price = (pos.entry_price * (new_qty - delta) + price * delta) / new_qty
 
+    async def reconcile_state(self) -> None:
+        """Re-sync the position mirror with the broker (used after a
+        detected sleep/wake gap — local state is suspect)."""
+        from .reconcile import reconcile
+
+        await reconcile(self._broker, self.repo, self.state)
+
     # --- kill-switch emergency path --- #
     async def emergency_cancel_all(self) -> None:
         try:

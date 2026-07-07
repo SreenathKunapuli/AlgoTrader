@@ -20,7 +20,8 @@ typecheck:
 	$(PY) -m mypy
 
 run-engine:
-	$(PY) -m lobplatform.cli run --tier medium
+	# caffeinate: a sleeping laptop is a dead trading engine (macOS)
+	caffeinate -is $(PY) -m lobplatform.cli run --tier medium
 
 run-api:
 	$(PY) -m uvicorn app.main:app --app-dir api --port 8000
