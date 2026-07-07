@@ -44,6 +44,16 @@ RANGES = {"1d": timedelta(days=1), "1w": timedelta(weeks=1),
           "1m": timedelta(days=30), "all": None}
 
 
+def iso_utc(dt: datetime | None) -> str | None:
+    """DB datetimes come back naive from SQLite; stamp them as the UTC they are."""
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    return dt.isoformat()
+
+
+
 class LoginBody(BaseModel):
     password: str
 
@@ -97,7 +107,7 @@ def orders(status: str | None = None, limit: int = Query(100, le=1000),
         return [{
             "client_order_id": o.client_order_id, "symbol": o.symbol, "side": o.side,
             "qty": o.qty, "type": o.order_type, "status": o.status,
-            "ts": o.ts.isoformat(), "limit_price": o.limit_price,
+            "ts": iso_utc(o.ts), "limit_price": o.limit_price,
             "filled_qty": o.filled_qty, "fill_price": o.fill_price, "reason": o.reason,
         } for o in s.scalars(q)]
 
@@ -111,7 +121,7 @@ def trades(since: str | None = None, limit: int = Query(100, le=1000),
             q = q.where(Trade.exit_ts >= datetime.fromisoformat(since))
         return [{
             "symbol": t.symbol, "side": t.side, "qty": t.qty,
-            "entry_ts": t.entry_ts.isoformat(), "exit_ts": t.exit_ts.isoformat(),
+            "entry_ts": iso_utc(t.entry_ts), "exit_ts": iso_utc(t.exit_ts),
             "entry_price": t.entry_price, "exit_price": t.exit_price,
             "pnl": round(t.pnl, 2), "signal_scores": t.signal_scores_json,
             "holding_seconds": (t.exit_ts - t.entry_ts).total_seconds(),
@@ -128,7 +138,7 @@ def equity_curve(range: str = "1d",
         span = RANGES[range]
         if span is not None:
             q = q.where(EquitySnapshot.ts >= datetime.now(UTC) - span)
-        pts = [{"ts": r.ts.isoformat(), "equity": r.equity} for r in s.scalars(q)]
+        pts = [{"ts": iso_utc(r.ts), "equity": r.equity} for r in s.scalars(q)]
     return downsample(pts)
 
 
@@ -158,7 +168,7 @@ def signals_latest(_: dict = Depends(require_auth)) -> list[dict[str, Any]]:  # 
     latest: dict[str, SignalRecord] = {}
     for r in rows:
         latest.setdefault(r.symbol, r)
-    return [{"symbol": r.symbol, "ts": r.ts.isoformat(), "ensemble": r.ensemble,
+    return [{"symbol": r.symbol, "ts": iso_utc(r.ts), "ensemble": r.ensemble,
              "per_signal": r.scores_json} for r in latest.values()]
 
 
@@ -167,7 +177,7 @@ def signals_health(_: dict = Depends(require_auth)) -> list[dict[str, Any]]:  # 
     with repo.session() as s:
         rows = list(s.scalars(select(SignalHealth)
                               .order_by(SignalHealth.id.desc()).limit(50)))
-    return [{"signal": r.signal, "ts": r.ts.isoformat(),
+    return [{"signal": r.signal, "ts": iso_utc(r.ts),
              "rolling_hit_rate": r.rolling_hit_rate,
              "attributed_pnl_20s": r.attributed_pnl_20s,
              "weight_multiplier": r.weight_multiplier,
@@ -181,7 +191,7 @@ def engine_status(_: dict = Depends(require_auth)) -> dict[str, Any]:  # type: i
               if st.heartbeat_ts else None)
     return {"status": st.status, "tier": st.tier, "halted_reason": st.halted_reason,
             "heartbeat_age_s": hb_age,
-            "last_data_ts": st.last_data_ts.isoformat() if st.last_data_ts else None,
+            "last_data_ts": iso_utc(st.last_data_ts),
             "trading_mode": settings.trading_mode}
 
 
@@ -217,7 +227,7 @@ def rejections(limit: int = Query(50, le=500),
     with repo.session() as s:
         rows = list(s.scalars(select(RiskRejection)
                               .order_by(RiskRejection.id.desc()).limit(limit)))
-    return [{"ts": r.ts.isoformat(), "reason": r.reason, "intent": r.intent_json}
+    return [{"ts": iso_utc(r.ts), "reason": r.reason, "intent": r.intent_json}
             for r in rows]
 
 
@@ -261,11 +271,11 @@ async def ws_stream(ws: WebSocket, token: str = Query("")) -> None:
                                        .order_by(EquitySnapshot.id)):
                         last_eq_id = max(last_eq_id, r.id)
                         await ws.send_json({"channel": "equity",
-                                            "data": {"ts": r.ts.isoformat(),
+                                            "data": {"ts": iso_utc(r.ts),
                                                      "equity": r.equity,
                                                      "cash": r.cash,
                                                      "gross": r.gross_exposure},
-                                            "ts": r.ts.isoformat()})
+                                            "ts": iso_utc(r.ts)})
             if "engine_status" in channels:
                 st = repo.get_state()
                 if st.status != last_status:

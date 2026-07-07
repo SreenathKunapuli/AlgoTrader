@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import { api } from "@/lib/api";
 import { useStream } from "@/hooks/useStream";
+import { fmtET } from "@/lib/time";
 
 type Sig = { symbol: string; ts: string; ensemble: number; per_signal: Record<string, unknown> };
 
@@ -59,7 +60,7 @@ export default function Signals() {
                     })}
                   </div>
                 </td>
-                <td className="text-xs text-gray-500">{new Date(r.ts).toLocaleTimeString()}</td>
+                <td className="text-xs text-gray-500">{fmtET(r.ts)}</td>
               </tr>
             ))}
             {rows.length === 0 && (

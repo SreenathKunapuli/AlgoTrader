@@ -9,6 +9,7 @@ import {
 } from "lightweight-charts";
 import { useEffect, useRef, useState } from "react";
 import { api } from "@/lib/api";
+import { toEtEpoch } from "@/lib/time";
 
 type Range = "1d" | "1w" | "1m" | "all";
 const RANGES: Range[] = ["1d", "1w", "1m", "all"];
@@ -44,7 +45,7 @@ export default function EquityChart({ liveEquity }: { liveEquity?: { ts: string;
       .then((pts) => {
         // dedupe on second granularity and enforce ascending order
         const byTime = new Map<number, number>();
-        for (const p of pts) byTime.set(Math.floor(new Date(p.ts).getTime() / 1000), p.equity);
+        for (const p of pts) byTime.set(toEtEpoch(p.ts), p.equity);
         const data = Array.from(byTime.entries())
           .sort((a, b) => a[0] - b[0])
           .map(([t, v]) => ({ time: t as UTCTimestamp, value: v }));
@@ -56,7 +57,7 @@ export default function EquityChart({ liveEquity }: { liveEquity?: { ts: string;
 
   useEffect(() => {
     if (!liveEquity || !series.current) return;
-    const t = Math.floor(new Date(liveEquity.ts).getTime() / 1000);
+    const t = toEtEpoch(liveEquity.ts);
     if (t < lastTime.current) return; // stale tick from a load/stream race
     lastTime.current = t;
     series.current.update({ time: t as UTCTimestamp, value: liveEquity.equity });
