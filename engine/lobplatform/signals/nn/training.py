@@ -41,6 +41,18 @@ class WindowDataset(Dataset):  # type: ignore[type-arg]
         return torch.from_numpy(self.x[t - self.window + 1: t + 1]), int(self.y[t])
 
 
+def directional_accuracy(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    """P(correct direction | model predicts a direction AND the market moves).
+
+    Matches evaluate_signal.simulate_trades: FLAT predictions are abstentions,
+    not directional failures, and FLAT truths are ~zero-PnL, not losses. The
+    recall-style variant (any non-flat bar the model didn't call) once gated
+    lob_flow to zero confidence despite 53.9% precision on its actual calls.
+    """
+    both = (y_pred != 1) & (y_true != 1)
+    return float((y_pred[both] == y_true[both]).mean()) if both.any() else 0.0
+
+
 def macro_f1(y_true: np.ndarray, y_pred: np.ndarray, n_classes: int = 3) -> float:
     f1s = []
     for c in range(n_classes):
@@ -115,11 +127,12 @@ def train(
             trues_l.append(yb.numpy())
     yp, yt = np.concatenate(preds_l), np.concatenate(trues_l)
     nonflat = yt != 1
-    dir_acc = float((yp[nonflat] == yt[nonflat]).mean()) if nonflat.any() else 0.0
+    dir_recall = float((yp[nonflat] == yt[nonflat]).mean()) if nonflat.any() else 0.0
     cm = [[int(np.sum((yt == i) & (yp == j))) for j in range(3)] for i in range(3)]
     metrics = {
         "val_macro_f1": round(best_f1, 4),
-        "directional_accuracy": round(dir_acc, 4),
+        "directional_accuracy": round(directional_accuracy(yt, yp), 4),
+        "directional_recall_nonflat": round(dir_recall, 4),
         "confusion_matrix": cm,
         "n_train": len(ds_tr), "n_val": len(ds_va), "arch": arch,
     }

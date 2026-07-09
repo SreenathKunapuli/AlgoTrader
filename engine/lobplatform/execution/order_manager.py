@@ -1,8 +1,20 @@
 """OrderManager — the sole route to the broker; requires Approval tokens.
 
-Order policy (§ decision table): limit at mid ± 10% of spread (buy above
-mid, sell below — toward the touch); unfilled after 30s -> cancel-replace
-as market. TIF=DAY. Idempotent client_order_id =
+Order policy, split by Approval.urgent (research/cost_aware_experiment.py:
+taker PnL is negative on every stock/horizon tested even with perfect
+foresight; maker PnL is positive — so entries must never pay the spread):
+
+  ENTRY (urgent=False): limit at the near touch (mid − spread/2 buy,
+  mid + spread/2 sell — earn the spread). Unfilled after 30s ->
+  cancel-replace once at mid; unfilled 30s more -> cancel and EXPIRE.
+  A missed entry costs nothing; a spread-crossed entry has negative
+  expectancy at our horizons.
+
+  EXIT (urgent=True: stop / eod / kill / signal-flip): limit at mid ± 10%
+  of spread toward the touch; unfilled after 30s -> cancel-replace as
+  market. Certainty of getting flat beats spread cost.
+
+TIF=DAY. Idempotent client_order_id =
 sha1(f"{strategy}:{symbol}:{side}:{bar_ts_iso}")[:32].
 
 emergency_* methods are the kill switch's path — they go straight to the
@@ -13,7 +25,9 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+from collections.abc import Callable, Coroutine
 from datetime import UTC, datetime
+from typing import Any
 
 import structlog
 
@@ -25,6 +39,13 @@ from .broker import AlpacaBroker, BrokerOrder
 log = structlog.get_logger()
 
 UNFILLED_REPLACE_S = 30.0
+
+
+def _schedule(delay: float, coro_factory: Callable[[], Coroutine[Any, Any, None]]) -> None:
+    """Run an async follow-up after `delay`s; the coroutine is created only
+    when the timer fires (an eagerly-created one would leak if never run)."""
+    asyncio.get_event_loop().call_later(
+        delay, lambda: asyncio.ensure_future(coro_factory()))
 
 
 def make_client_order_id(strategy: str, symbol: str, side: str, bar_ts: datetime) -> str:
@@ -40,11 +61,16 @@ class OrderManager:
 
     async def submit(self, approval: Approval, bar_ts: datetime,
                      mid: float, spread: float, strategy: str = "ensemble") -> BrokerOrder | None:
-        """Submit an approved intent as a limit order with market fallback."""
+        """Submit an approved intent as a limit order (see module policy)."""
         intent = approval.intent
         coid = make_client_order_id(strategy, intent.symbol, intent.side, bar_ts)
-        offset = 0.10 * max(spread, 0.0)
-        limit_price = mid + offset if intent.side == "buy" else mid - offset
+        spread = max(spread, 0.0)
+        if approval.urgent:
+            offset = 0.10 * spread
+            limit_price = mid + offset if intent.side == "buy" else mid - offset
+        else:
+            half = 0.5 * spread
+            limit_price = mid - half if intent.side == "buy" else mid + half
         try:
             order = await self._broker.submit_order(
                 symbol=intent.symbol, side=intent.side, qty=intent.qty,
@@ -60,17 +86,59 @@ class OrderManager:
                                side=intent.side, qty=intent.qty, order_type="limit",
                                limit_price=limit_price, status=order.status,
                                ts=datetime.now(UTC), reason=intent.reason)
-        asyncio.get_event_loop().call_later(
-            UNFILLED_REPLACE_S,
-            lambda: asyncio.ensure_future(self._replace_if_unfilled(order, intent.reason)),
-        )
+        if approval.urgent:
+            _schedule(UNFILLED_REPLACE_S,
+                      lambda: self._replace_if_unfilled(order, intent.reason))
+        else:
+            _schedule(UNFILLED_REPLACE_S,
+                      lambda: self._repeg_entry(order, intent.reason, mid))
         return order
+
+    async def _repeg_entry(self, order: BrokerOrder, reason: str, mid: float) -> None:
+        """Unfilled passive entry: concede half the spread once (re-peg to
+        mid), never cross. The second leg expires via _expire_entry."""
+        try:
+            live = await self._find_open(order.id)
+            if live is None:
+                return  # filled or already cancelled
+            await self._broker.cancel_order(order.id)
+            remaining = live.qty - live.filled_qty
+            if remaining <= 0:
+                return
+            coid = f"{order.client_order_id[:24]}-rp"
+            repegged = await self._broker.submit_order(
+                symbol=order.symbol, side=order.side, qty=remaining,
+                order_type="limit", client_order_id=coid, limit_price=mid)
+            self.repo.upsert_order(coid, broker_order_id=repegged.id,
+                                   symbol=order.symbol, side=order.side,
+                                   qty=remaining, order_type="limit",
+                                   limit_price=mid, status=repegged.status,
+                                   ts=datetime.now(UTC), reason=reason)
+            log.info("order.entry_repegged", symbol=order.symbol, qty=remaining)
+            _schedule(UNFILLED_REPLACE_S, lambda: self._expire_entry(repegged))
+        except Exception as exc:
+            log.error("order.repeg_failed", error=str(exc))
+
+    async def _expire_entry(self, order: BrokerOrder) -> None:
+        """Give up on an unfilled entry — cancel, don't chase."""
+        try:
+            live = await self._find_open(order.id)
+            if live is None:
+                return
+            await self._broker.cancel_order(order.id)
+            log.info("order.entry_expired", symbol=order.symbol,
+                     unfilled=live.qty - live.filled_qty)
+        except Exception as exc:
+            log.error("order.expire_failed", error=str(exc))
+
+    async def _find_open(self, order_id: str) -> BrokerOrder | None:
+        open_orders = await self._broker.get_open_orders()
+        return next((o for o in open_orders if o.id == order_id), None)
 
     async def _replace_if_unfilled(self, order: BrokerOrder, reason: str) -> None:
         """Cancel-replace as market if the limit hasn't fully filled in 30s."""
         try:
-            open_orders = await self._broker.get_open_orders()
-            live = next((o for o in open_orders if o.id == order.id), None)
+            live = await self._find_open(order.id)
             if live is None:
                 return  # filled or already cancelled
             await self._broker.cancel_order(order.id)
