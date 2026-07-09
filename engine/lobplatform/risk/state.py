@@ -20,6 +20,7 @@ class Position:
     stop_price: float | None = None
     entry_ts: datetime | None = None
     entry_signals: dict[str, float] = field(default_factory=dict)
+    book: str = "intraday"   # "intraday" (ensemble) | "xsec" (monthly momentum)
 
     @property
     def market_value(self) -> float:
@@ -44,6 +45,13 @@ class PortfolioState:
     @property
     def gross_exposure(self) -> float:
         return sum(abs(p.market_value) for p in self.positions.values())
+
+    def book_gross(self, book: str) -> float:
+        return sum(abs(p.market_value) for p in self.positions.values()
+                   if p.book == book)
+
+    def book_positions(self, book: str) -> dict[str, Position]:
+        return {s: p for s, p in self.positions.items() if p.book == book}
 
     @property
     def day_pnl(self) -> float:

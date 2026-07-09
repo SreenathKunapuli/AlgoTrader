@@ -60,3 +60,14 @@ def in_eod_flatten_window(ts: datetime) -> bool:
         return False
     c = session_close(ts)
     return c is not None and ts >= c - timedelta(minutes=5)
+
+
+def is_last_session_of_month(ts: datetime) -> bool:
+    """True when `ts` falls in the month's final XNYS session (xsec rebalance day)."""
+    t = pd.Timestamp(ts)
+    try:
+        sess = _CAL.minute_to_session(t, direction="none")
+    except Exception:
+        return False
+    nxt = _CAL.next_session(sess)
+    return bool(nxt.month != sess.month or nxt.year != sess.year)

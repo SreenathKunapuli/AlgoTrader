@@ -81,6 +81,15 @@ class Engine:
         self._last_rebalance = datetime.min.replace(tzinfo=UTC)
         self.health = SignalHealthTracker(repo, list(ensemble.signals))
         self._paused_stale = False
+        # set by cli when the xsec book is enabled; guards below keep the
+        # intraday paths off xsec positions even before the retag loop runs
+        self.xsec: Any = None
+
+    def _is_xsec(self, symbol: str) -> bool:
+        pos = self.state.positions.get(symbol)
+        if pos is not None and pos.book == "xsec":
+            return True
+        return bool(self.xsec and symbol in self.xsec.holdings)
 
     # ---------------- data path ---------------- #
     def warmup(self, history: dict[str, list[Bar]]) -> None:
@@ -194,7 +203,7 @@ class Engine:
     async def _maybe_exit_on_signal(self, symbol: str, bars: list[Bar],
                                     score: float) -> None:
         pos = self.state.positions.get(symbol)
-        if not pos:
+        if not pos or pos.book != "intraday":
             return
         # exit when the signal flips against the position or dies
         if (pos.qty > 0 and score <= 0) or (pos.qty < 0 and score >= 0):
@@ -202,6 +211,8 @@ class Engine:
 
     async def _enter_or_adjust(self, symbol: str, bars: list[Bar],
                                res: Any, now: datetime) -> None:
+        if self._is_xsec(symbol):
+            return  # symbol belongs to the monthly book; one owner per symbol
         price = bars[-1].close
         atr = atr_from_bars(bars)
         target_qty = size_position(self.tier, self.state.equity, price, atr, res.vol_mult)
@@ -292,9 +303,10 @@ class Engine:
             now = datetime.now(UTC)
             if self.state.halted or self.tier.name == Tier.LOW:
                 continue  # LOW holds overnight
-            if calendar.in_eod_flatten_window(now) and self.state.positions:
-                log.info("eod.flatten", n=len(self.state.positions))
-                for sym in list(self.state.positions):
+            intraday = [s for s in self.state.positions if not self._is_xsec(s)]
+            if calendar.in_eod_flatten_window(now) and intraday:
+                log.info("eod.flatten", n=len(intraday))
+                for sym in intraday:
                     await self._exit_position(sym, "eod")
 
     async def heartbeat(self) -> None:

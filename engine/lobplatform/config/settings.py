@@ -40,6 +40,7 @@ class Settings(BaseSettings):
 
     # engine
     risk_tier: str = "medium"
+    xsec_enabled: bool = True  # monthly cross-sectional momentum book
     lob_flow_arch: str = "tcn"
     bar_interval_s: int = 60
     signal_bar_interval_s: int = 300

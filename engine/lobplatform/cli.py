@@ -106,15 +106,25 @@ async def _run(tier_name: str) -> None:
 
     stream = MarketStream(s.alpaca_api_key, s.alpaca_secret_key, tier.universe,
                           engine.on_trade, engine.on_quote, engine.on_stream_bar)
-    log.info("engine.start", tier=tier_name, universe=len(tier.universe))
-    await asyncio.gather(
+    tasks = [
         stream.run_forever(),
         engine.staleness_monitor(),
         engine.eod_flattener(),
         engine.heartbeat(),
         engine.command_poller(),
         engine.day_roll(),
-    )
+    ]
+    if s.xsec_enabled:
+        from .strategy.xsec_momentum import XsecMomentumStrategy
+
+        xsec = XsecMomentumStrategy(s, state, engine.risk, om, repo, pubsub)
+        engine.xsec = xsec
+        xsec.retag()  # restore book tags over the freshly reconciled mirror
+        tasks.append(xsec.run())
+        log.info("xsec.enabled", holdings=len(xsec.holdings),
+                 last_rebalance=xsec.last_rebalance_month)
+    log.info("engine.start", tier=tier_name, universe=len(tier.universe))
+    await asyncio.gather(*tasks)
 
 
 def main() -> None:
