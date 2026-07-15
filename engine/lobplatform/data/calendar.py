@@ -71,3 +71,22 @@ def is_last_session_of_month(ts: datetime) -> bool:
         return False
     nxt = _CAL.next_session(sess)
     return bool(nxt.month != sess.month or nxt.year != sess.year)
+
+
+def last_completed_month_end(ts: datetime) -> pd.Timestamp | None:
+    """Most recent month-final session STRICTLY BEFORE the session containing
+    (or following) `ts`. Lets the xsec book detect a month-end it slept
+    through: if that session's month is newer than last_rebalance_month,
+    a catch-up rebalance is due."""
+    t = pd.Timestamp(ts)
+    try:
+        sess = _CAL.minute_to_session(t, direction="next")
+        cur = _CAL.previous_session(sess)
+    except Exception:
+        return None
+    for _ in range(40):  # a month-end is always within ~23 sessions
+        nxt = _CAL.next_session(cur)
+        if nxt.month != cur.month or nxt.year != cur.year:
+            return cur
+        cur = _CAL.previous_session(cur)
+    return None

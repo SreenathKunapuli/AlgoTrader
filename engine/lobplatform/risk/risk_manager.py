@@ -15,6 +15,7 @@ from datetime import UTC, datetime
 from typing import Literal
 
 from ..config.tiers import TierConfig
+from ..config.xsec import XSEC, XsecConfig
 from ..data import calendar
 from .state import PortfolioState
 
@@ -51,9 +52,18 @@ class Rejection:
 
 
 class RiskManager:
-    def __init__(self, tier: TierConfig, state: PortfolioState) -> None:
+    def __init__(self, tier: TierConfig, state: PortfolioState,
+                 xsec_cfg: XsecConfig = XSEC) -> None:
         self.tier = tier
         self.state = state
+        self.xsec_cfg = xsec_cfg
+        self._dynamic_universe: set[str] = set()
+
+    def add_to_universe(self, symbols: list[str]) -> None:
+        self._dynamic_universe.update(symbols)
+
+    def reset_dynamic_universe(self) -> None:
+        self._dynamic_universe.clear()
 
     def _issue(self, intent: OrderIntent, urgent: bool = False) -> Approval:
         return Approval(intent=intent, token=secrets.token_hex(8),
@@ -81,13 +91,18 @@ class RiskManager:
         delta = intent.qty if intent.side == "buy" else -intent.qty
         return abs(cur_qty + delta) > abs(cur_qty)
 
-    def approve(self, intent: OrderIntent,
-                now: datetime | None = None) -> Approval | Rejection:
+    def approve(self, intent: OrderIntent, now: datetime | None = None,
+                urgent: bool = False) -> Approval | Rejection:
         """Full check sequence per §5.4, in order. Entry path.
 
         Book routing: xsec intents skip tier-universe/tier-cap checks and
-        use XSEC config caps instead; kill-state, loss-limit, drawdown, and
-        entry-window checks are shared — no book escapes those.
+        use the xsec profile caps instead; kill-state, account-floor, and
+        entry-window checks are shared — no book escapes those. The daily
+        loss limit is scoped to the intraday book; the xsec circuit
+        breaker (buys halted on within-cycle book drawdown) is scoped to
+        xsec. `urgent=True` marks the approval for urgent execution
+        (limit near touch, market replace) — every risk check still runs;
+        only the execution style changes (xsec rebalance final sweep).
         """
         now = now or datetime.now(UTC)
         s, t = self.state, self.tier
@@ -97,41 +112,60 @@ class RiskManager:
             return Rejection(intent, "non-positive quantity")
         pos = s.positions.get(intent.symbol)
         if pos and pos.qty != 0 and pos.book != intent.book:
-            return Rejection(intent, f"symbol held by {pos.book} book")
-        if intent.book == "intraday" and intent.symbol not in t.universe:
+            # Allow intraday long add-ons on top of long xsec positions (the addon is
+            # EOD-flattened each day while the monthly base stays; no book conflict).
+            xsec_addon = (intent.book == "intraday" and pos.book == "xsec"
+                          and intent.side == "buy" and pos.qty > 0)
+            if not xsec_addon:
+                return Rejection(intent, f"symbol held by {pos.book} book")
+        if (intent.book == "intraday"
+                and intent.symbol not in t.universe
+                and intent.symbol not in self._dynamic_universe):
             return Rejection(intent, f"symbol {intent.symbol} not in tier universe")
         is_entry = self._is_entry(intent)
         if is_entry:
             cur_qty = pos.qty if pos else 0
             delta = intent.qty if intent.side == "buy" else -intent.qty
             if intent.book == "xsec":
-                from ..config.xsec import XSEC
+                cfg = self.xsec_cfg
+                if s.xsec_buys_halted and intent.side == "buy":
+                    return Rejection(intent, "xsec buys halted (book drawdown breaker)")
                 if (cur_qty + delta) < 0:
                     return Rejection(intent, "xsec book is long-only")
-                if self._post_trade_position_value(intent) > XSEC.max_position_pct * s.equity + 1e-6:
+                if self._post_trade_position_value(intent) > cfg.max_position_pct * s.equity + 1e-6:
                     return Rejection(intent, "exceeds xsec max position size")
-                if self._post_trade_gross(intent) > XSEC.alloc_pct * s.equity + 1e-6:
+                if self._post_trade_gross(intent) > cfg.alloc_pct * s.equity + 1e-6:
                     return Rejection(intent, "exceeds xsec book allocation")
                 new_symbol = intent.symbol not in s.book_positions("xsec")
-                if new_symbol and len(s.book_positions("xsec")) >= XSEC.top_n:
+                if new_symbol and len(s.book_positions("xsec")) >= cfg.top_n:
                     return Rejection(intent, "exceeds xsec max positions")
             else:
-                if (cur_qty + delta) < 0 and not t.allow_short:
-                    return Rejection(intent, "shorting not allowed in this tier")
-                if self._post_trade_position_value(intent) > t.max_position_pct * s.equity + 1e-6:
-                    return Rejection(intent, "exceeds max position size")
-                if self._post_trade_gross(intent) > t.max_gross_pct * s.equity + 1e-6:
-                    return Rejection(intent, "exceeds max gross exposure")
-                new_symbol = intent.symbol not in s.book_positions("intraday")
-                if new_symbol and len(s.book_positions("intraday")) >= t.max_open_positions:
-                    return Rejection(intent, "exceeds max open positions")
-            if s.day_pnl_pct <= -t.daily_loss_limit_pct:
-                return Rejection(intent, "daily loss limit reached")
+                if s.intraday_halted:
+                    return Rejection(intent, "intraday book halted")
+                xsec_addon = (pos is not None and pos.book == "xsec")
+                if xsec_addon:
+                    # Addon to an xsec position: check only the addon delta size.
+                    # The xsec book manages its base position under its own caps.
+                    addon_val = intent.qty * intent.price_hint
+                    if addon_val > t.max_position_pct * s.equity + 1e-6:
+                        return Rejection(intent, "xsec intraday addon exceeds position limit")
+                else:
+                    if (cur_qty + delta) < 0 and not t.allow_short:
+                        return Rejection(intent, "shorting not allowed in this tier")
+                    if self._post_trade_position_value(intent) > t.max_position_pct * s.equity + 1e-6:
+                        return Rejection(intent, "exceeds max position size")
+                    if self._post_trade_gross(intent) > t.max_gross_pct * s.equity + 1e-6:
+                        return Rejection(intent, "exceeds max gross exposure")
+                    new_symbol = intent.symbol not in s.book_positions("intraday")
+                    if new_symbol and len(s.book_positions("intraday")) >= t.max_open_positions:
+                        return Rejection(intent, "exceeds max open positions")
+                if s.intraday_day_pnl_pct <= -t.daily_loss_limit_pct:
+                    return Rejection(intent, "daily loss limit reached")
             if s.drawdown_pct >= t.max_drawdown_pct:
-                return Rejection(intent, "max drawdown reached")
+                return Rejection(intent, "account drawdown floor reached")
             if not calendar.in_entry_window(now):
                 return Rejection(intent, "outside entry window")
-        return self._issue(intent)
+        return self._issue(intent, urgent=urgent)
 
     def approve_exit(self, intent: OrderIntent) -> Approval | Rejection:
         """Stops / EOD / kill flatten: risk-checked but window/cap-exempt."""

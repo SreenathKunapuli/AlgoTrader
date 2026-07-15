@@ -12,7 +12,6 @@ import json
 from datetime import UTC, datetime
 
 import pytest
-
 from lobplatform.config.tiers import TIERS, Tier
 from lobplatform.config.xsec import XsecConfig
 from lobplatform.risk.risk_manager import OrderIntent, Rejection, RiskManager
@@ -113,14 +112,24 @@ def test_xsec_book_does_not_consume_intraday_gross():
 def test_xsec_long_only_and_cross_book_lock():
     state = make_state()
     risk = RiskManager(TIER, state)
+    # xsec book is long-only: sell intent must be rejected
     short = OrderIntent(symbol="ZTS", side="sell", qty=10, price_hint=100.0, book="xsec")
     r = risk.approve(short, ENTRY_TS)
     assert isinstance(r, Rejection) and "long-only" in r.reason
+
     state.positions["AAPL"] = Position(symbol="AAPL", qty=10, entry_price=100.0,
                                        mark=100.0, book="xsec")
-    intraday = OrderIntent(symbol="AAPL", side="buy", qty=5, price_hint=100.0)
-    r2 = risk.approve(intraday, ENTRY_TS)
-    assert isinstance(r2, Rejection) and "held by xsec" in r2.reason
+    risk.add_to_universe(["AAPL"])
+
+    # Intraday LONG add-on on an xsec long position is now allowed
+    intraday_long = OrderIntent(symbol="AAPL", side="buy", qty=5, price_hint=100.0)
+    r2 = risk.approve(intraday_long, ENTRY_TS)
+    assert not isinstance(r2, Rejection), f"expected approval, got: {r2.reason if isinstance(r2, Rejection) else ''}"
+
+    # Intraday SHORT on an xsec position must still be rejected (cross-book conflict)
+    intraday_short = OrderIntent(symbol="AAPL", side="sell", qty=5, price_hint=100.0)
+    r3 = risk.approve(intraday_short, ENTRY_TS)
+    assert isinstance(r3, Rejection) and "held by xsec" in r3.reason
 
 
 # ---------------- strategy: targets, persistence, retag ---------------- #
@@ -185,6 +194,76 @@ def test_book_file_is_valid_json_after_save(tmp_path):
     state = make_state()
     strat = make_strategy(state, tmp_path)
     strat.holdings = {"AAPL": 3}
+    strat.pending = {"MSFT": 7}
     strat._save_book()
     data = json.loads(strat.book_file.read_text())
     assert data["holdings"] == {"AAPL": 3}
+    assert data["pending"] == {"MSFT": 7}
+    strat2 = make_strategy(state, tmp_path)
+    assert strat2.pending == {"MSFT": 7}  # shortfalls survive restarts
+
+
+# ---------------- catch-up, deltas, circuit breaker ---------------- #
+def test_last_completed_month_end_calendar():
+    from lobplatform.data import calendar as cal
+
+    # Thursday 2026-07-02: June's final session was Tuesday 2026-06-30
+    me = cal.last_completed_month_end(datetime(2026, 7, 2, 15, 0, tzinfo=UTC))
+    assert me is not None and me.strftime("%Y-%m-%d") == "2026-06-30"
+    # standing ON a month-end session, the last COMPLETED one is May's
+    me2 = cal.last_completed_month_end(datetime(2026, 6, 30, 15, 0, tzinfo=UTC))
+    assert me2 is not None and me2.strftime("%Y-%m") == "2026-05"
+
+
+def test_missed_month_catch_up(tmp_path):
+    state = make_state()
+    strat = make_strategy(state, tmp_path)
+    mid = datetime(2026, 7, 2, 19, 45, tzinfo=UTC)  # engine was down June 30
+    assert strat.missed_month(mid) == "2026-06"
+    strat.last_rebalance_month = "2026-06"          # already rebalanced: no-op
+    assert strat.missed_month(mid) is None
+    strat.last_rebalance_month = ""
+    strat.cfg = XsecConfig(catch_up_missed=False)   # opt-out honored
+    assert strat.missed_month(mid) is None
+    strat.cfg = XsecConfig()
+    state.halted = True                             # halted engine never trades
+    assert strat.missed_month(mid) is None
+
+
+def test_deltas_cover_buys_and_explicit_exits(tmp_path):
+    state = make_state()
+    strat = make_strategy(state, tmp_path)
+    state.positions["OLD"] = Position(symbol="OLD", qty=10, entry_price=100.0,
+                                      mark=100.0, book="xsec")
+    state.positions["KEEP"] = Position(symbol="KEEP", qty=5, entry_price=100.0,
+                                       mark=100.0, book="xsec")
+    targets = {"NEW": 5, "KEEP": 5, "OLD": 0}
+    assert strat._deltas(targets) == {"NEW": 5, "OLD": -10}
+
+
+def test_breaker_trips_and_clears(tmp_path):
+    state = make_state()
+    strat = make_strategy(state, tmp_path)
+    state.positions["AAA"] = Position(symbol="AAA", qty=100, entry_price=100.0,
+                                      mark=55.0, book="xsec")  # -45% vs basis
+    strat.update_breaker()
+    assert state.xsec_buys_halted
+    state.positions["AAA"].mark = 90.0                          # recovers
+    strat.update_breaker()
+    assert not state.xsec_buys_halted
+
+
+def test_profiles_form_a_ladder():
+    from lobplatform.config.tiers import TIERS as ALL_TIERS
+    from lobplatform.config.xsec import XSEC_BY_TIER
+
+    low, med, high = (XSEC_BY_TIER[t] for t in (Tier.LOW, Tier.MEDIUM, Tier.HIGH))
+    assert low.top_n > med.top_n > high.top_n          # concentration ladder
+    assert low.alloc_pct <= med.alloc_pct <= high.alloc_pct
+    for tier, cfg in XSEC_BY_TIER.items():
+        # equal weight must fit under the per-position cap (drift headroom)
+        assert cfg.alloc_pct / cfg.top_n <= cfg.max_position_pct
+        # account floor sits beyond the profile's backtest DD at allocation
+        # (profiles.csv: top-50 -36.5%, top-20 -40.4%, top-10 -42.6%)
+        backtest_dd = {50: 0.365, 20: 0.404, 10: 0.426}[cfg.top_n]
+        assert ALL_TIERS[tier].max_drawdown_pct > backtest_dd * cfg.alloc_pct

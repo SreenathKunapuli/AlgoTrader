@@ -22,6 +22,7 @@ import structlog
 
 from .config.settings import Settings
 from .config.tiers import TIERS, Tier, TierConfig
+from .config.xsec import XSEC_BY_TIER
 from .data import calendar
 from .data.bar_builder import Bar, BarBuilder, aggregate
 from .execution.order_manager import OrderManager
@@ -62,11 +63,12 @@ class Engine:
         self.ensemble = ensemble
         self.state = state
         self.pubsub = pubsub
-        self.risk = RiskManager(tier, state)
+        self.risk = RiskManager(tier, state, xsec_cfg=XSEC_BY_TIER[tier.name])
         self.kill = KillSwitch(state, tier, repo, order_manager, pubsub_emit(pubsub),
                                staleness_kill_s=settings.staleness_kill_s,
                                broker_error_count=settings.broker_error_kill_count,
-                               broker_error_window_s=settings.broker_error_kill_window_s)
+                               broker_error_window_s=settings.broker_error_kill_window_s,
+                               flatten_intraday=self._flatten_intraday)
         self.builder = BarBuilder(interval_s=settings.bar_interval_s)
         self.bars_1m: dict[str, deque[Bar]] = defaultdict(lambda: deque(maxlen=12000))
         self.bars_5m: dict[str, deque[Bar]] = defaultdict(lambda: deque(maxlen=MAX_5M_BARS))
@@ -84,6 +86,13 @@ class Engine:
         # set by cli when the xsec book is enabled; guards below keep the
         # intraday paths off xsec positions even before the retag loop runs
         self.xsec: Any = None
+        # COIDs of intraday add-on orders placed on top of xsec positions;
+        # used by the fill handler to route these fills as "intraday" rather than "xsec"
+        self._xsec_intraday_coids: set[str] = set()
+        # starts as the frozen tier universe; day_scanner appends to this each session
+        self._live_universe: list[str] = list(tier.universe)
+        # stop prices staged at order-submit time, applied on fill (avoids async race)
+        self._pending_stops: dict[str, float] = {}
 
     def _is_xsec(self, symbol: str) -> bool:
         pos = self.state.positions.get(symbol)
@@ -170,10 +179,14 @@ class Engine:
 
     async def on_five_min_bar(self, bar: Bar) -> None:
         await self.check_stops(bar)
-        reason = self.kill.check_triggers()
-        if reason and not self.state.halted:
-            await self.kill.fire(reason)
-            return
+        trig = self.kill.check_triggers()
+        if trig:
+            scope, reason = trig
+            if scope == "account" and not self.state.halted:
+                await self.kill.fire(reason)
+                return
+            if scope == "intraday" and not self.state.intraday_halted:
+                await self.kill.fire_intraday(reason)
         now = datetime.now(UTC)
         if (now - self._last_rebalance).total_seconds() >= self.tier.rebalance_seconds:
             self._last_rebalance = now
@@ -181,11 +194,37 @@ class Engine:
 
     # ---------------- decision path ---------------- #
     async def rebalance(self, now: datetime) -> None:
-        if self.state.halted or self._paused_stale:
+        if self.state.halted or self.state.intraday_halted or self._paused_stale:
             return
         if not calendar.in_entry_window(now):
             return
-        for symbol in self.tier.universe:
+
+        # Advance trailing stops before computing new signals.
+        # For intraday longs: only trail when a stop is already set (pending_stops
+        # covers the gap between submit and fill for brand-new positions).
+        # For xsec addons (pos.qty > pos.xsec_qty): initialise + trail; retag clears
+        # stop_price on the base, so any non-None value here belongs to the addon.
+        mult = self.tier.stop_atr_multiple
+        for sym, pos in list(self.state.positions.items()):
+            if pos.qty <= 0:
+                continue
+            sym_bars = list(self.bars_5m.get(sym, ()))
+            if len(sym_bars) < 30:
+                continue
+            atr = atr_from_bars(sym_bars)
+            price = sym_bars[-1].close
+            trailing = price - mult * atr
+            if pos.book == "intraday" and pos.stop_price is not None:
+                if trailing > pos.stop_price:
+                    pos.stop_price = trailing
+                    log.info("stop.trail", symbol=sym,
+                             stop=round(trailing, 2), price=round(price, 2))
+            elif pos.book == "xsec" and pos.qty > pos.xsec_qty:
+                if pos.stop_price is None or trailing > pos.stop_price:
+                    pos.stop_price = trailing
+                    log.info("stop.trail_addon", symbol=sym, stop=round(trailing, 2))
+
+        for symbol in self._live_universe:
             bars = list(self.bars_5m.get(symbol, ()))
             if len(bars) < 30:
                 continue
@@ -203,27 +242,83 @@ class Engine:
     async def _maybe_exit_on_signal(self, symbol: str, bars: list[Bar],
                                     score: float) -> None:
         pos = self.state.positions.get(symbol)
-        if not pos or pos.book != "intraday":
+        if not pos:
             return
-        # exit when the signal flips against the position or dies
-        if (pos.qty > 0 and score <= 0) or (pos.qty < 0 and score >= 0):
-            await self._exit_position(symbol, "signal")
+        if pos.book == "intraday":
+            if (pos.qty > 0 and score <= 0) or (pos.qty < 0 and score >= 0):
+                await self._exit_position(symbol, "signal")
+        elif pos.book == "xsec":
+            addon = pos.qty - pos.xsec_qty
+            if addon > 0 and score <= 0:
+                await self._exit_position(symbol, "signal", target_qty=pos.xsec_qty)
 
     async def _enter_or_adjust(self, symbol: str, bars: list[Bar],
                                res: Any, now: datetime) -> None:
-        if self._is_xsec(symbol):
-            return  # symbol belongs to the monthly book; one owner per symbol
+        is_xsec = self._is_xsec(symbol)
+        if is_xsec and res.final_score < 0:
+            return  # never take an intraday short against an xsec long position
+
         price = bars[-1].close
         atr = atr_from_bars(bars)
         target_qty = size_position(self.tier, self.state.equity, price, atr, res.vol_mult)
         if res.final_score < 0:
             target_qty = -target_qty if self.tier.allow_short else 0
+
         pos = self.state.positions.get(symbol)
-        cur_qty = pos.qty if pos else 0
+        # For xsec symbols: treat the intraday add-on layer as cur_qty (not the full
+        # position, which includes the monthly base the xsec book owns).
+        cur_qty = ((pos.qty - pos.xsec_qty) if pos else 0) if is_xsec else (pos.qty if pos else 0)
+
         delta = target_qty - cur_qty
-        if delta == 0 or target_qty == 0 and cur_qty == 0:
+        if delta == 0 or (target_qty == 0 and cur_qty == 0):
             return
         side: Literal["buy", "sell"] = "buy" if delta > 0 else "sell"
+
+        is_new_entry = cur_qty == 0 or (cur_qty > 0 and delta > 0) or (cur_qty < 0 and delta < 0)
+
+        # Time gate: screener picks (not base-universe, not xsec) stop accepting new
+        # entries at 10:30am ET — small/mid-cap volume collapses after the opening hour.
+        # xsec holdings are large/mid-cap and liquid all session, so they're exempt.
+        if is_new_entry and not is_xsec and symbol not in self.tier.universe:
+            from zoneinfo import ZoneInfo
+            now_et = now.astimezone(ZoneInfo("America/New_York"))
+            if now_et.hour > 10 or (now_et.hour == 10 and now_et.minute >= 30):
+                log.info("entry.time_gate", symbol=symbol,
+                         now_et=now_et.strftime("%H:%M"))
+                return
+
+        # LOB flow directional gate — only for new entries, not exits/adjustments.
+        # Only applied when confidence >= lob_flow_min_conf (below that the score is
+        # noise from sparse book data and should not veto the other signals).
+        # One-sided: blocks when flow opposes direction; does NOT require positive flow
+        # to buy (73% of buy candidates have negative LOB even on valid trades — a
+        # symmetric gate would shut the engine down).
+        if is_new_entry:
+            lob = res.per_signal.get("lob_flow", {})
+            lob_score = lob.get("score", 0.0)
+            lob_conf  = lob.get("confidence", 0.0)
+            gate      = self.tier.lob_flow_gate
+            min_conf  = self.tier.lob_flow_min_conf
+            if lob_conf >= min_conf:
+                if delta > 0 and lob_score < -gate:
+                    log.info("lob_flow.gate_blocked", symbol=symbol,
+                             lob_score=round(lob_score, 3), lob_conf=round(lob_conf, 3),
+                             gate=gate, side="long")
+                    self.repo.add_rejection(
+                        f"lob_flow gate: score {lob_score:.3f} (conf {lob_conf:.2f}) < -{gate} for long",
+                        {"symbol": symbol, "side": side,
+                         "lob_score": lob_score, "lob_conf": lob_conf})
+                    return
+                if delta < 0 and lob_score > gate:
+                    log.info("lob_flow.gate_blocked", symbol=symbol,
+                             lob_score=round(lob_score, 3), lob_conf=round(lob_conf, 3),
+                             gate=gate, side="short")
+                    self.repo.add_rejection(
+                        f"lob_flow gate: score {lob_score:.3f} (conf {lob_conf:.2f}) > {gate} for short",
+                        {"symbol": symbol, "side": side,
+                         "lob_score": lob_score, "lob_conf": lob_conf})
+                    return
+
         intent = OrderIntent(symbol=symbol, side=side, qty=abs(delta),
                              price_hint=price, reason="signal")
         approval = self.risk.approve(intent, now)
@@ -240,22 +335,36 @@ class Engine:
                 await self.kill.fire("5 consecutive broker errors in 60s")
             return
         if order:
-            stop_mult = self.tier.stop_atr_multiple
-            stop = price - stop_mult * atr if delta > 0 else price + stop_mult * atr
-            # record intended stop; on_fill will attach it to the position
-            p = self.state.positions.get(symbol)
-            if p:
-                p.stop_price = stop
+            if is_xsec:
+                # Track all COID variants so fills route correctly as "intraday"
+                # regardless of whether the entry, repeg, or market-replace fires.
+                coid = order.client_order_id
+                self._xsec_intraday_coids.update({
+                    coid, coid[:24] + "-rp", coid[:24] + "-mkt"})
+                log.info("xsec.intraday_addon", symbol=symbol, qty=abs(delta))
+            else:
+                stop_mult = self.tier.stop_atr_multiple
+                stop = price - stop_mult * atr if delta > 0 else price + stop_mult * atr
+                p = self.state.positions.get(symbol)
+                if p:
+                    p.stop_price = stop
+                self._pending_stops[symbol] = stop
             await self.pubsub.publish("orders", {
                 "symbol": symbol, "side": side, "qty": abs(delta),
                 "ts": now.isoformat(), "reason": "signal"})
 
-    async def _exit_position(self, symbol: str, reason: str) -> None:
+    async def _exit_position(self, symbol: str, reason: str, target_qty: int = 0) -> None:
+        """Exit to `target_qty` (default 0 = full close). Positive target keeps that many
+        shares — used by EOD flattener and signal-flip to close only the intraday addon
+        on top of an xsec base while leaving the monthly position intact."""
         pos = self.state.positions.get(symbol)
         if not pos or pos.qty == 0:
             return
-        side: Literal["buy", "sell"] = "sell" if pos.qty > 0 else "buy"
-        intent = OrderIntent(symbol=symbol, side=side, qty=abs(pos.qty),
+        close_qty = pos.qty - target_qty
+        if close_qty == 0:
+            return
+        side: Literal["buy", "sell"] = "sell" if close_qty > 0 else "buy"
+        intent = OrderIntent(symbol=symbol, side=side, qty=abs(close_qty),
                              price_hint=pos.mark, reason=reason)
         approval = self.risk.approve_exit(intent)
         if isinstance(approval, Rejection):
@@ -267,6 +376,12 @@ class Engine:
         except Exception as exc:
             log.error("exit.submit_failed", symbol=symbol, error=str(exc))
 
+    async def _flatten_intraday(self, reason: str) -> None:
+        """Graceful exit (urgent limit -> market) of every intraday-book
+        position; the xsec book is untouched. Kill switch's intraday path."""
+        for sym in [s for s in list(self.state.positions) if not self._is_xsec(s)]:
+            await self._exit_position(sym, "kill")
+
     async def check_stops(self, bar: Bar) -> None:
         pos = self.state.positions.get(bar.symbol)
         if not pos or pos.stop_price is None:
@@ -275,7 +390,13 @@ class Engine:
               (pos.qty < 0 and bar.high >= pos.stop_price)
         if hit:
             log.info("stop.hit", symbol=bar.symbol, stop=pos.stop_price)
-            await self._exit_position(bar.symbol, "stop")
+            if pos.book == "xsec":
+                # Close only the intraday addon; clear stop so it doesn't re-fire
+                # on the next bar while the exit order is still pending.
+                await self._exit_position(bar.symbol, "stop", target_qty=pos.xsec_qty)
+                pos.stop_price = None
+            else:
+                await self._exit_position(bar.symbol, "stop")
 
     # ---------------- background tasks ---------------- #
     async def staleness_monitor(self) -> None:
@@ -286,7 +407,8 @@ class Engine:
                 continue
             stale = (now - self.state.last_data_ts).total_seconds()
             if stale > self.settings.staleness_kill_s:
-                await self.kill.fire(f"data staleness {stale:.0f}s")
+                # intraday scope: the xsec book doesn't depend on the stream
+                await self.kill.fire_intraday(f"data staleness {stale:.0f}s")
             elif stale > self.settings.staleness_pause_s and not self._paused_stale:
                 self._paused_stale = True
                 self.repo.update_state(status="PAUSED")
@@ -304,10 +426,14 @@ class Engine:
             if self.state.halted or self.tier.name == Tier.LOW:
                 continue  # LOW holds overnight
             intraday = [s for s in self.state.positions if not self._is_xsec(s)]
-            if calendar.in_eod_flatten_window(now) and intraday:
-                log.info("eod.flatten", n=len(intraday))
+            xsec_addons = [(s, p) for s, p in self.state.positions.items()
+                           if self._is_xsec(s) and p.qty > p.xsec_qty]
+            if calendar.in_eod_flatten_window(now) and (intraday or xsec_addons):
+                log.info("eod.flatten", n=len(intraday), xsec_addons=len(xsec_addons))
                 for sym in intraday:
                     await self._exit_position(sym, "eod")
+                for sym, p in xsec_addons:
+                    await self._exit_position(sym, "eod", target_qty=p.xsec_qty)
 
     async def heartbeat(self) -> None:
         last_beat = datetime.now(UTC)
@@ -323,11 +449,21 @@ class Engine:
                 except Exception as exc:
                     log.error("wake.reconcile_failed", error=str(exc))
             self.state.peak_equity = max(self.state.peak_equity, self.state.equity)
-            pos_payload = [{"symbol": p.symbol, "qty": p.qty, "entry": p.entry_price,
-                            "mark": p.mark, "upnl": round(p.unrealized_pnl, 2),
-                            "stop": p.stop_price,
-                            "age_s": (now - p.entry_ts).total_seconds() if p.entry_ts else None}
-                           for p in self.state.positions.values()]
+            def _pos_dict(p, now=now):
+                return {
+                    "symbol": p.symbol,
+                    "side": "long" if p.qty > 0 else "short",
+                    "qty": p.qty,
+                    "book": p.book,
+                    "entry": p.entry_price,
+                    "mark": p.mark,
+                    "market_value": round(p.market_value, 2),
+                    "upnl": round(p.unrealized_pnl, 2),
+                    "stop": p.stop_price,
+                    "age_s": (now - p.entry_ts).total_seconds() if p.entry_ts else None,
+                    "entry_signals": p.entry_signals,
+                }
+            pos_payload = [_pos_dict(p) for p in self.state.positions.values()]
             self.repo.update_state(heartbeat_ts=now, last_data_ts=self.state.last_data_ts,
                                    peak_equity=self.state.peak_equity,
                                    positions_json=pos_payload)
@@ -336,11 +472,7 @@ class Engine:
             await self.pubsub.publish("equity", {
                 "ts": now.isoformat(), "equity": self.state.equity,
                 "cash": self.state.cash, "gross": self.state.gross_exposure})
-            await self.pubsub.publish("positions", {
-                "positions": [{"symbol": p.symbol, "qty": p.qty, "entry": p.entry_price,
-                               "mark": p.mark, "upnl": p.unrealized_pnl,
-                               "stop": p.stop_price}
-                              for p in self.state.positions.values()]})
+            await self.pubsub.publish("positions", {"positions": pos_payload})
 
     async def command_poller(self) -> None:
         """API -> engine control channel (kill / reset / set_tier)."""
@@ -360,9 +492,26 @@ class Engine:
                     if tier_name in [t.value for t in Tier] and not self.state.halted:
                         self.tier = TIERS[Tier(tier_name)]
                         self.risk.tier = self.tier
+                        self.risk.xsec_cfg = XSEC_BY_TIER[self.tier.name]
                         self.kill.tier = self.tier
+                        if self.xsec is not None:  # profile follows the tier
+                            self.xsec.cfg = self.risk.xsec_cfg
                         self.repo.update_state(tier=tier_name)
                 self.repo.mark_command_done(cmd.id)
+
+    def expand_universe(self, symbols: list[str]) -> None:
+        """Add screener-sourced symbols to the live universe for this session.
+
+        Caller (cli.day_scanner) must have already warmed up bar history via
+        engine.warmup() before calling this so rebalance() has enough bars to
+        score them immediately.
+        """
+        new = [s for s in symbols if s not in self._live_universe]
+        if not new:
+            return
+        self._live_universe.extend(new)
+        self.risk.add_to_universe(new)
+        log.info("universe.expanded", added=new, total=len(self._live_universe))
 
     async def day_roll(self) -> None:
         """Reset day-start equity at each session open."""
@@ -373,7 +522,15 @@ class Engine:
             if calendar.is_session_open(now) and last_day != now.date():
                 last_day = now.date()
                 self.state.day_start_equity = self.state.equity
+                self.state.intraday_realized_today = 0.0
+                if self.state.intraday_halted:  # day-scoped halt: new-day amnesty
+                    self.state.intraday_halted = False
+                    self.repo.update_state(status="RUNNING", halted_reason="")
+                    log.info("intraday_halt.cleared")
                 self.repo.update_state(day_start_equity=self.state.equity)
+                # reset dynamic universe — yesterday's movers don't carry over
+                self._live_universe = list(self.tier.universe)
+                self.risk.reset_dynamic_universe()
                 # shadow evaluation: refresh per-signal health multipliers
                 self.ensemble.health_multipliers = self.health.evaluate(now)
                 log.info("day.roll", equity=self.state.equity,

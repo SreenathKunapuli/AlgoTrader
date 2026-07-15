@@ -37,6 +37,7 @@ class Settings(BaseSettings):
     app_password: str = "change-me"
     jwt_secret: str = "change-me"
     jwt_expiry_hours: int = 24
+    cors_origins: str = "http://localhost:3000"  # comma-separated
 
     # engine
     risk_tier: str = "medium"

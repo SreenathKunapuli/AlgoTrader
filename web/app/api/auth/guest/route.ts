@@ -1,15 +1,14 @@
-// Login proxy: exchanges the password for a backend JWT and stores it in an
-// httpOnly cookie — the token is never exposed to client-side JS.
+// Guest login: no password — issues a read-only token and sets the httpOnly cookie.
 import { NextRequest, NextResponse } from "next/server";
 
 const API = process.env.API_INTERNAL_BASE ?? "http://localhost:8000";
 
 export async function POST(req: NextRequest) {
-  const body = await req.json();
-  const res = await fetch(`${API}/auth/login`, {
+  const res = await fetch(`${API}/auth/guest`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
+    // forward the client IP for the rate limiter
+    body: JSON.stringify({}),
   });
   if (!res.ok) {
     return NextResponse.json(await res.json().catch(() => ({})), {
@@ -22,13 +21,14 @@ export async function POST(req: NextRequest) {
     httpOnly: true,
     sameSite: "lax",
     path: "/",
-    maxAge: 60 * 60 * 24,
+    maxAge: 60 * 60 * 8,   // 8h matches token expiry
   });
-  out.cookies.set("lob_role", "owner", {
+  // Non-httpOnly role cookie so client JS can hide/show controls without an API call.
+  out.cookies.set("lob_role", "guest", {
     httpOnly: false,
     sameSite: "lax",
     path: "/",
-    maxAge: 60 * 60 * 24,
+    maxAge: 60 * 60 * 8,
   });
   return out;
 }

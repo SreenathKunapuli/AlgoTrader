@@ -1,6 +1,10 @@
 PY := .venv/bin/python
 PIP := .venv/bin/pip
 
+# Port the API server binds to. Override locally in an untracked Makefile.local.
+API_PORT ?= 8000
+-include Makefile.local
+
 .PHONY: setup test lint typecheck run-engine run-api run-web run-all train-signal evaluate-signal
 
 setup:
@@ -24,7 +28,7 @@ run-engine:
 	caffeinate -is $(PY) -m lobplatform.cli run --tier medium
 
 run-api:
-	$(PY) -m uvicorn app.main:app --app-dir api --port 8000
+	$(PY) -m uvicorn app.main:app --app-dir api --port $(API_PORT)
 
 run-web:
 	cd web && npm run dev

@@ -159,15 +159,18 @@ class OrderManager:
 
     # --- fill bookkeeping (called from trade-updates stream / polling) --- #
     def on_fill(self, symbol: str, side: str, qty: int, price: float,
-                reason: str, signals: dict[str, float] | None = None) -> None:
-        """Update the position mirror and record round-trips on close."""
+                reason: str, signals: dict[str, float] | None = None,
+                book: str = "intraday") -> None:
+        """Update the position mirror and record round-trips on close.
+        `book` only labels NEW positions (existing ones keep their tag —
+        the xsec retag loop remains authoritative within one tick)."""
         delta = qty if side == "buy" else -qty
         pos = self.state.positions.get(symbol)
         now = datetime.now(UTC)
         if pos is None or pos.qty == 0:
             self.state.positions[symbol] = Position(
                 symbol=symbol, qty=delta, entry_price=price, mark=price,
-                entry_ts=now, entry_signals=signals or {})
+                entry_ts=now, entry_signals=signals or {}, book=book)
             return
         new_qty = pos.qty + delta
         closing = (pos.qty > 0 > delta) or (pos.qty < 0 < delta)
@@ -175,6 +178,8 @@ class OrderManager:
             closed = min(abs(delta), abs(pos.qty))
             side_str = "long" if pos.qty > 0 else "short"
             pnl = (price - pos.entry_price) * closed * (1 if pos.qty > 0 else -1)
+            if pos.book == "intraday":
+                self.state.intraday_realized_today += pnl
             self.repo.add_trade(symbol=symbol, side=side_str, qty=closed,
                                 entry_ts=pos.entry_ts or now, exit_ts=now,
                                 entry_price=pos.entry_price, exit_price=price,

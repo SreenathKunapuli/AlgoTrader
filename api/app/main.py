@@ -27,7 +27,7 @@ from lobplatform.persistence.repo import Repo
 from pydantic import BaseModel
 from sqlalchemy import select
 
-from .auth import check_login_rate, decode_token, issue_token, require_auth
+from .auth import check_login_rate, decode_token, issue_guest_token, issue_token, require_auth, require_owner
 from .metrics import compute_metrics, downsample
 
 settings = get_settings()
@@ -35,8 +35,7 @@ repo = Repo(settings.resolved_database_url())
 app = FastAPI(title="LOB Platform API", version="0.1.0")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[o.strip() for o in
-                   (getattr(settings, "cors_origins", "") or "http://localhost:3000").split(",")],
+    allow_origins=[o.strip() for o in settings.cors_origins.split(",")],
     allow_methods=["*"], allow_headers=["*"], allow_credentials=True,
 )
 
@@ -70,6 +69,18 @@ class TierBody(BaseModel):
 def login(body: LoginBody, request: Request) -> dict[str, str]:
     check_login_rate(request)
     return {"token": issue_token(body.password)}
+
+
+@app.post("/auth/guest")
+def guest_login(request: Request) -> dict[str, str]:
+    """No password required — returns a read-only token (8h expiry)."""
+    check_login_rate(request)
+    return {"token": issue_guest_token()}
+
+
+@app.get("/auth/me")
+def me(payload: dict = Depends(require_auth)) -> dict[str, str]:  # type: ignore[type-arg]
+    return {"role": str(payload.get("role", "owner")), "sub": str(payload.get("sub", ""))}
 
 
 @app.get("/account")
@@ -196,7 +207,7 @@ def engine_status(_: dict = Depends(require_auth)) -> dict[str, Any]:  # type: i
 
 
 @app.put("/config/tier")
-def set_tier(body: TierBody, _: dict = Depends(require_auth)) -> dict[str, str]:  # type: ignore[type-arg]
+def set_tier(body: TierBody, _: dict = Depends(require_owner)) -> dict[str, str]:  # type: ignore[type-arg]
     if body.tier not in [t.value for t in Tier]:
         raise HTTPException(422, "tier must be low|medium|high")
     if repo.get_state().status == "HALTED":
@@ -206,7 +217,7 @@ def set_tier(body: TierBody, _: dict = Depends(require_auth)) -> dict[str, str]:
 
 
 @app.post("/engine/kill")
-def kill(body: ConfirmBody, _: dict = Depends(require_auth)) -> dict[str, str]:  # type: ignore[type-arg]
+def kill(body: ConfirmBody, _: dict = Depends(require_owner)) -> dict[str, str]:  # type: ignore[type-arg]
     if not body.confirm:
         raise HTTPException(422, 'requires {"confirm": true}')
     repo.enqueue_command("kill")
@@ -214,7 +225,7 @@ def kill(body: ConfirmBody, _: dict = Depends(require_auth)) -> dict[str, str]: 
 
 
 @app.post("/engine/reset")
-def reset(body: ConfirmBody, _: dict = Depends(require_auth)) -> dict[str, str]:  # type: ignore[type-arg]
+def reset(body: ConfirmBody, _: dict = Depends(require_owner)) -> dict[str, str]:  # type: ignore[type-arg]
     if not body.confirm:
         raise HTTPException(422, 'requires {"confirm": true}')
     repo.enqueue_command("reset")

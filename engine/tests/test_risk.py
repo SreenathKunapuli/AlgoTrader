@@ -90,16 +90,48 @@ def test_rejects_max_positions(state) -> None:  # type: ignore[no-untyped-def]
 
 
 def test_rejects_daily_loss(state) -> None:  # type: ignore[no-untyped-def]
-    state.equity = 97_500.0  # -2.5% on the day
+    state.intraday_realized_today = -2_500.0  # intraday book -2.5% on the day
     r = RiskManager(MED, state).approve(_intent(), IN_SESSION)
     assert isinstance(r, Rejection) and "daily loss" in r.reason
 
 
+def test_daily_loss_does_not_block_xsec(state) -> None:  # type: ignore[no-untyped-def]
+    state.intraday_realized_today = -2_500.0
+    x = OrderIntent(symbol="ZTS", side="buy", qty=10, price_hint=100.0,
+                    reason="xsec_rebalance", book="xsec")
+    r = RiskManager(MED, state).approve(x, IN_SESSION)
+    assert isinstance(r, Approval)  # intraday breach must not gate the monthly book
+
+
 def test_rejects_drawdown(state) -> None:  # type: ignore[no-untyped-def]
-    state.peak_equity = 120_000.0  # 100k now -> 16.7% DD
+    state.peak_equity = 160_000.0  # 100k now -> 37.5% DD > 35% MEDIUM floor
     state.day_start_equity = state.equity  # keep day pnl at 0
     r = RiskManager(MED, state).approve(_intent(), IN_SESSION)
     assert isinstance(r, Rejection) and "drawdown" in r.reason
+    # the floor is account-wide: xsec entries are refused too
+    x = OrderIntent(symbol="ZTS", side="buy", qty=10, price_hint=100.0, book="xsec")
+    assert isinstance(RiskManager(MED, state).approve(x, IN_SESSION), Rejection)
+
+
+def test_intraday_halt_scoped_to_intraday(state) -> None:  # type: ignore[no-untyped-def]
+    state.intraday_halted = True
+    rm = RiskManager(MED, state)
+    r = rm.approve(_intent(), IN_SESSION)
+    assert isinstance(r, Rejection) and "intraday" in r.reason
+    x = OrderIntent(symbol="ZTS", side="buy", qty=10, price_hint=100.0, book="xsec")
+    assert isinstance(rm.approve(x, IN_SESSION), Approval)
+
+
+def test_xsec_breaker_blocks_buys_not_sells(state) -> None:  # type: ignore[no-untyped-def]
+    state.xsec_buys_halted = True
+    rm = RiskManager(MED, state)
+    buy = OrderIntent(symbol="ZTS", side="buy", qty=10, price_hint=100.0, book="xsec")
+    r = rm.approve(buy, IN_SESSION)
+    assert isinstance(r, Rejection) and "breaker" in r.reason
+    state.positions["ZTS"] = Position(symbol="ZTS", qty=10, entry_price=100.0,
+                                      mark=100.0, book="xsec")
+    sell = OrderIntent(symbol="ZTS", side="sell", qty=10, price_hint=100.0, book="xsec")
+    assert isinstance(rm.approve(sell, IN_SESSION), Approval)  # de-risk always allowed
 
 
 def test_rejects_outside_entry_window(state) -> None:  # type: ignore[no-untyped-def]

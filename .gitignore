@@ -25,3 +25,4 @@ lobengine.pid
 data/*.pkl
 data/xsec_book.json
 data/xsec_results/
+Makefile.local

@@ -60,6 +60,37 @@ def fetch_latest_closes(
     return {s: float(resp.data[s][-1].close) for s in symbols if resp.data.get(s)}
 
 
+def fetch_latest_quotes(
+    api_key: str, secret_key: str, symbols: list[str]
+) -> dict[str, tuple[float, float]]:
+    """{symbol: (bid, ask)} from the free REAL-TIME IEX feed.
+
+    Why: SIP history on the free tier is 15-min delayed — pricing rebalance
+    limit orders off it systematically misses names that moved (the ones
+    momentum just picked). IEX latest quotes are real-time; thin names may
+    come back zero/crossed and are simply omitted (caller falls back to the
+    daily-close mark).
+    """
+    if not symbols:
+        return {}
+    from alpaca.data.requests import StockLatestQuoteRequest
+
+    client = StockHistoricalDataClient(api_key, secret_key)
+    out: dict[str, tuple[float, float]] = {}
+    for i in range(0, len(symbols), 200):
+        chunk = symbols[i: i + 200]
+        req = StockLatestQuoteRequest(symbol_or_symbols=chunk, feed="iex")
+        quotes: Any = client.get_stock_latest_quote(req)
+        for sym in chunk:
+            q = quotes.get(sym)
+            if q is None:
+                continue
+            bid, ask = float(q.bid_price or 0.0), float(q.ask_price or 0.0)
+            if bid > 0.0 and ask > bid:
+                out[sym] = (bid, ask)
+    return out
+
+
 def fetch_minute_bars(
     api_key: str, secret_key: str, symbols: list[str], days: int = 30
 ) -> dict[str, list[Bar]]:

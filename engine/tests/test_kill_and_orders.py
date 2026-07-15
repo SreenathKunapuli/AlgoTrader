@@ -50,7 +50,7 @@ async def test_kill_persists_across_restart(state, repo, mock_broker) -> None:  
     assert repo.get_state().halted_reason == "daily loss"
 
 
-def test_kill_triggers(state, repo, mock_broker) -> None:  # type: ignore[no-untyped-def]
+def test_kill_triggers_scoped(state, repo, mock_broker) -> None:  # type: ignore[no-untyped-def]
     async def emit(ch: str, data: dict) -> None:  # type: ignore[type-arg]
         pass
 
@@ -60,14 +60,37 @@ def test_kill_triggers(state, repo, mock_broker) -> None:  # type: ignore[no-unt
 
     state.last_data_ts = in_session
     assert ks.check_triggers(in_session) is None
-    state.equity = 97_000.0  # -3% day
-    assert "daily loss" in (ks.check_triggers(in_session) or "")
-    state.equity = 100_000.0
-    state.peak_equity = 125_000.0
-    assert "drawdown" in (ks.check_triggers(in_session) or "")
+    state.intraday_realized_today = -3_000.0  # intraday book -3% day
+    scope, reason = ks.check_triggers(in_session) or ("", "")
+    assert scope == "intraday" and "daily loss" in reason
+    state.intraday_realized_today = 0.0
+    state.peak_equity = 160_000.0  # 37.5% DD > 35% MEDIUM account floor
+    scope, reason = ks.check_triggers(in_session) or ("", "")
+    assert scope == "account" and "drawdown" in reason
     state.peak_equity = 100_000.0
     state.last_data_ts = in_session - timedelta(seconds=200)
-    assert "staleness" in (ks.check_triggers(in_session) or "")
+    scope, reason = ks.check_triggers(in_session) or ("", "")
+    assert scope == "intraday" and "staleness" in reason
+
+
+async def test_intraday_kill_scoped(state, repo, mock_broker) -> None:  # type: ignore[no-untyped-def]
+    flattened: list[str] = []
+
+    async def flatten(reason: str) -> None:
+        flattened.append(reason)
+
+    async def emit(ch: str, data: dict) -> None:  # type: ignore[type-arg]
+        pass
+
+    om = OrderManager(mock_broker, repo, state)  # type: ignore[arg-type]
+    ks = KillSwitch(state, MED, repo, om, emit, flatten_intraday=flatten)
+    await ks.fire_intraday("intraday daily loss")
+    assert state.intraday_halted and not state.halted
+    assert flattened == ["intraday daily loss"]
+    assert mock_broker.closed_all == 0                     # no global flatten
+    assert repo.get_state().status == "INTRADAY_HALTED"    # informational only
+    await ks.fire_intraday("second")                       # idempotent
+    assert len(flattened) == 1
 
 
 def test_broker_error_trigger(state, repo, mock_broker) -> None:  # type: ignore[no-untyped-def]
@@ -146,6 +169,17 @@ def test_aggregate_5m() -> None:
     assert agg is not None
     assert agg.open == 100.0 and agg.close == 104.0 and agg.volume == 50
     assert agg.ts == bars[0].ts and agg.interval_s == 300
+
+
+async def test_on_fill_book_tag_and_realized_tracking(state, repo, mock_broker) -> None:  # type: ignore[no-untyped-def]
+    om = OrderManager(mock_broker, repo, state)  # type: ignore[arg-type]
+    om.on_fill("ZTS", "buy", 10, 100.0, "stream", book="xsec")
+    assert state.positions["ZTS"].book == "xsec"
+    om.on_fill("AAPL", "buy", 10, 100.0, "stream")
+    om.on_fill("AAPL", "sell", 10, 90.0, "stream")
+    assert state.intraday_realized_today == pytest.approx(-100.0)
+    om.on_fill("ZTS", "sell", 10, 90.0, "stream")  # xsec close: not intraday PnL
+    assert state.intraday_realized_today == pytest.approx(-100.0)
 
 
 @pytest.mark.parametrize("side,qty", [("buy", 3), ("sell", 3)])

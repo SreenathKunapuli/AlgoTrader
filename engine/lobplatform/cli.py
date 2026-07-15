@@ -35,12 +35,101 @@ def _repo() -> Repo:
     return Repo(s.resolved_database_url())
 
 
+async def _day_scanner(engine: "Engine", stream: "MarketStream",
+                       settings: "Settings", tier: "TierConfig") -> None:
+    """Once per session: wait for open + 60s, scan top gainers/most-active,
+    warm up their bar history, expand the engine's live universe, and trigger
+    a stream reconnect so new symbols start receiving bars.
+
+    Dynamic symbols are session-scoped: engine.day_roll() resets them each
+    morning before the next scan fires.
+    """
+    from .data import calendar
+    from .data.alpaca_stream import SUBSCRIPTION_LIMIT
+    from .data.history import fetch_minute_bars
+    from .data.screener import scan_candidates
+
+    # One scan slot per session: open + 60s (gap plays, pre-market catalysts).
+    # A midday rescan was considered but dropped: screener picks are gated at
+    # 10:30am ET in _enter_or_adjust (volume collapses on small/mid-caps after
+    # the opening hour), so any new names found later could not enter anyway.
+    SCAN_OFFSETS_S = [60]   # seconds after session open
+
+    session_open_ts: dict = {}   # date -> aware datetime of session open
+    completed_slots: dict = {}   # date -> set of completed slot indices
+
+    while True:
+        await asyncio.sleep(30)
+        dt = __import__("datetime")
+        now = dt.datetime.now(dt.timezone.utc)
+        if not calendar.is_session_open(now):
+            continue
+        today = now.date()
+
+        if today not in session_open_ts:
+            session_open_ts[today] = now   # approximate open time on first detection
+        if today not in completed_slots:
+            completed_slots[today] = set()
+
+        open_ts = session_open_ts[today]
+        elapsed = (now - open_ts).total_seconds()
+
+        # find the next slot that's due and not yet completed
+        slot_idx = None
+        for i, offset in enumerate(SCAN_OFFSETS_S):
+            if i not in completed_slots[today] and elapsed >= offset:
+                slot_idx = i
+                break
+        if slot_idx is None:
+            continue
+
+        completed_slots[today].add(slot_idx)
+        label = "open" if slot_idx == 0 else "midday"
+
+        # only add symbols not already in the live universe
+        exclude = set(engine._live_universe)
+        if engine.xsec:
+            exclude |= set(engine.xsec.holdings)
+        max_n = max(0, SUBSCRIPTION_LIMIT - len(engine._live_universe))
+        if max_n == 0:
+            log.info("day_scanner.slots_full", slot=label)
+            continue
+
+        try:
+            candidates = await asyncio.to_thread(
+                scan_candidates, settings.alpaca_api_key, settings.alpaca_secret_key,
+                exclude, max_n,
+            )
+        except Exception as exc:
+            log.warning("day_scanner.scan_failed", slot=label, error=str(exc))
+            continue
+
+        if not candidates:
+            log.info("day_scanner.no_candidates", slot=label)
+            continue
+
+        try:
+            history = await asyncio.to_thread(
+                fetch_minute_bars, settings.alpaca_api_key, settings.alpaca_secret_key,
+                candidates, settings.history_warmup_days,
+            )
+            engine.warmup(history)
+        except Exception as exc:
+            log.warning("day_scanner.warmup_failed", slot=label, error=str(exc))
+            continue
+
+        engine.expand_universe(candidates)
+        stream.update_symbols(engine._live_universe)
+        log.info("day_scanner.done", slot=label, added=candidates,
+                 universe_size=len(engine._live_universe))
+
+
 async def _run(tier_name: str) -> None:
     import atexit
     import os
     from pathlib import Path
 
-    from .data.alpaca_stream import MarketStream
+    from .data.alpaca_stream import MarketStream, TradeUpdateStream
     from .data.history import fetch_minute_bars
     from .engine import Engine
     from .execution.broker import AlpacaBroker
@@ -106,23 +195,71 @@ async def _run(tier_name: str) -> None:
 
     stream = MarketStream(s.alpaca_api_key, s.alpaca_secret_key, tier.universe,
                           engine.on_trade, engine.on_quote, engine.on_stream_bar)
+
+    async def _on_fill_event(symbol: str, side: str, qty: int, price: float,
+                             coid: str) -> None:
+        # Determine book: COID set identifies intraday add-ons on xsec symbols.
+        # All three COID variants (entry, -rp repeg, -mkt market-replace) are tracked.
+        if coid in engine._xsec_intraday_coids:
+            engine._xsec_intraday_coids.discard(coid)
+            book = "intraday"
+        elif engine.xsec and symbol in engine.xsec.holdings:
+            book = "xsec"
+        else:
+            book = "intraday"
+        om.on_fill(symbol, side, qty, price, reason="stream", book=book)
+        # Keep xsec_qty in sync with each xsec-book fill (incremental, not reset).
+        if book == "xsec":
+            pos = engine.state.positions.get(symbol)
+            if pos:
+                xsec_delta = qty if side == "buy" else -qty
+                pos.xsec_qty = max(0, pos.xsec_qty + xsec_delta)
+        # Apply ATR stop staged at submit time for non-xsec intraday fills.
+        if book == "intraday":
+            stop = engine._pending_stops.pop(symbol, None)
+            if stop is not None:
+                pos = engine.state.positions.get(symbol)
+                if pos and pos.book == "intraday":
+                    pos.stop_price = stop
+
+    trade_stream = TradeUpdateStream(s.alpaca_api_key, s.alpaca_secret_key,
+                                     paper=True, on_fill=_on_fill_event)
     tasks = [
         stream.run_forever(),
+        trade_stream.run_forever(),
         engine.staleness_monitor(),
         engine.eod_flattener(),
         engine.heartbeat(),
         engine.command_poller(),
         engine.day_roll(),
+        _day_scanner(engine, stream, s, tier),
     ]
     if s.xsec_enabled:
+        from .config.xsec import XSEC_BY_TIER
         from .strategy.xsec_momentum import XsecMomentumStrategy
 
-        xsec = XsecMomentumStrategy(s, state, engine.risk, om, repo, pubsub)
+        xsec = XsecMomentumStrategy(s, state, engine.risk, om, repo, pubsub,
+                                    cfg=XSEC_BY_TIER[tier.name])
         engine.xsec = xsec
         xsec.retag()  # restore book tags over the freshly reconciled mirror
         tasks.append(xsec.run())
-        log.info("xsec.enabled", holdings=len(xsec.holdings),
+        log.info("xsec.enabled", profile=tier_name, top_n=xsec.cfg.top_n,
+                 holdings=len(xsec.holdings), pending=len(xsec.pending),
                  last_rebalance=xsec.last_rebalance_month)
+
+        # Add xsec holdings to the intraday universe so 5-min signals are computed
+        # and intraday long add-ons can fire when momentum confirms the monthly thesis.
+        if xsec.holdings:
+            xsec_syms = list(xsec.holdings)
+            log.info("warmup.xsec_holdings", syms=xsec_syms)
+            try:
+                xsec_hist = fetch_minute_bars(s.alpaca_api_key, s.alpaca_secret_key,
+                                              xsec_syms, s.history_warmup_days)
+                engine.warmup(xsec_hist)
+            except Exception as exc:
+                log.warning("warmup.xsec_failed", error=str(exc))
+            engine.expand_universe(xsec_syms)
+            stream.update_symbols(engine._live_universe)
     log.info("engine.start", tier=tier_name, universe=len(tier.universe))
     await asyncio.gather(*tasks)
 

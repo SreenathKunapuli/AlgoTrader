@@ -33,7 +33,16 @@ def issue_token(password: str) -> str:
     s = get_settings()
     if not password or password != s.app_password:
         raise HTTPException(401, "invalid password")
-    payload = {"sub": "owner", "exp": datetime.now(UTC) + timedelta(hours=s.jwt_expiry_hours)}
+    payload = {"sub": "owner", "role": "owner",
+               "exp": datetime.now(UTC) + timedelta(hours=s.jwt_expiry_hours)}
+    return jwt.encode(payload, s.jwt_secret, algorithm="HS256")
+
+
+def issue_guest_token() -> str:
+    """Short-lived read-only token; no password required."""
+    s = get_settings()
+    payload = {"sub": "guest", "role": "guest",
+               "exp": datetime.now(UTC) + timedelta(hours=8)}
     return jwt.encode(payload, s.jwt_secret, algorithm="HS256")
 
 
@@ -50,3 +59,12 @@ def require_auth(
     if creds is None:
         raise HTTPException(401, "missing bearer token")
     return decode_token(creds.credentials)
+
+
+def require_owner(
+    payload: dict[str, object] = Depends(require_auth),
+) -> dict[str, object]:
+    """Rejects guest tokens — use on any write/control endpoint."""
+    if payload.get("role") == "guest":
+        raise HTTPException(403, "spectator access only — sign in as owner to make changes")
+    return payload

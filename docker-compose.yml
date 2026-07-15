@@ -7,8 +7,32 @@ services:
       POSTGRES_DB: lob
     ports: ["5432:5432"]
     volumes: [pgdata:/var/lib/postgresql/data]
+
   redis:
     image: redis:7-alpine
     ports: ["6379:6379"]
+
+  api:
+    build:
+      context: .
+      dockerfile: api/Dockerfile
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+psycopg2://lob:lob@postgres:5432/lob
+      REDIS_URL: redis://redis:6379/0
+    ports: ["8000:8000"]
+    depends_on: [postgres, redis]
+
+  web:
+    build:
+      context: .
+      dockerfile: web/Dockerfile
+      args:
+        API_INTERNAL_BASE: http://api:8000
+    environment:
+      API_INTERNAL_BASE: http://api:8000
+    ports: ["3000:3000"]
+    depends_on: [api]
+
 volumes:
   pgdata:

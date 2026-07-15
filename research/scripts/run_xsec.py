@@ -22,6 +22,13 @@ from research.xsec.data import fetch_daily, load_universe, to_panels  # noqa: E4
 
 OOS_START_YEAR = 2020
 
+# Liquidity-at-the-time eligibility screen. 300 ≈ top 60% of the ~500-name
+# panel, matching the live book's liquidity_keep=0.60 (config/xsec.py).
+# Without this screen the backtest inflates ~5%/yr from index-inclusion bias
+# (measured 2026-07-09: unfiltered mom 33.2% CAGR vs 28.4% filtered) — the
+# headline numbers are ALWAYS the filtered ones.
+ELIGIBLE_TOP = 300
+
 
 def main() -> None:
     root = Path(__file__).resolve().parents[2]
@@ -35,7 +42,7 @@ def main() -> None:
           f"{close.index[0].date()} .. {close.index[-1].date()}")
 
     dates = ft.month_end_dates(close.index)
-    ds = ft.build_dataset(close, volume, dates)
+    ds = ft.build_dataset(close, volume, dates, eligible_top=ELIGIBLE_TOP)
     print(f"dataset: {len(ds):,} samples over {ds['date'].nunique()} rebalance dates")
 
     oos_years = sorted({int(d.year) for d in dates if d.year >= OOS_START_YEAR})

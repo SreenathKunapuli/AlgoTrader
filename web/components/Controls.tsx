@@ -2,6 +2,7 @@
 // Tier selector (confirm dialog with limits) + kill switch (typed FLATTEN).
 import { useState } from "react";
 import { api } from "@/lib/api";
+import { useRole } from "@/lib/useRole";
 
 const TIER_LIMITS: Record<string, string> = {
   low: "5% max position · 40% gross · 1% daily loss kill · long only · daily rebalance",
@@ -10,8 +11,20 @@ const TIER_LIMITS: Record<string, string> = {
 };
 
 export function TierSelector({ current }: { current: string }) {
+  const role = useRole();
   const [pending, setPending] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+
+  if (role === "guest") {
+    return (
+      <div className="flex items-center gap-2">
+        <span className="rounded-lg border border-gray-700 bg-gray-900 px-3 py-1.5 text-xs font-medium capitalize text-gray-400">
+          {current} tier
+        </span>
+        <span className="text-xs text-gray-600">(read-only)</span>
+      </div>
+    );
+  }
 
   async function confirm() {
     if (!pending) return;
@@ -62,9 +75,12 @@ export function TierSelector({ current }: { current: string }) {
 }
 
 export function KillButton() {
+  const role = useRole();
   const [open, setOpen] = useState(false);
   const [typed, setTyped] = useState("");
   const [busy, setBusy] = useState(false);
+
+  if (role === "guest") return null;
 
   async function fire() {
     setBusy(true);

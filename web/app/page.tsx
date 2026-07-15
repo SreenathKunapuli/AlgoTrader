@@ -8,7 +8,7 @@ import { KillButton, TierSelector } from "@/components/Controls";
 
 type Account = { equity: number; cash: number; gross_exposure: number; day_pnl: number; day_pnl_pct: number };
 type Status = { status: string; tier: string; halted_reason: string; trading_mode: string };
-type Position = { symbol: string; qty: number; entry: number; mark: number; upnl: number; stop: number | null };
+type Position = { symbol: string; qty: number; book: string; entry: number; mark: number; upnl: number; stop: number | null };
 
 const pillColor: Record<string, string> = {
   RUNNING: "bg-emerald-700",
@@ -83,14 +83,19 @@ export default function Dashboard() {
         <table className="w-full text-sm">
           <thead className="text-left text-xs text-gray-500">
             <tr>
-              <th>Symbol</th><th>Qty</th><th>Entry → Mark</th><th>Unrealized</th><th>Stop</th>
+              <th>Symbol</th><th>Type</th><th>Qty</th><th>Entry → Mark</th><th>Unrealized</th><th>Stop</th>
             </tr>
           </thead>
           <tbody className="text-gray-200">
             {positions.map((p) => (
               <tr key={p.symbol} className="border-t border-gray-800">
                 <td className="py-2 font-medium">{p.symbol}</td>
-                <td>{p.qty}</td>
+                <td>
+                  <span className={`rounded px-1.5 py-0.5 text-xs font-semibold ${p.book === "xsec" ? "bg-violet-900 text-violet-300" : "bg-sky-900 text-sky-300"}`}>
+                    {p.book === "xsec" ? "Monthly" : "Day Trade"}
+                  </span>
+                </td>
+                <td>{Math.abs(p.qty)}</td>
                 <td>${p.entry?.toFixed(2)} → ${p.mark?.toFixed(2)}</td>
                 <td className={p.upnl >= 0 ? "text-emerald-400" : "text-red-400"}>${p.upnl?.toFixed(2)}</td>
                 <td>{p.stop ? `$${p.stop.toFixed(2)}` : "—"}</td>
