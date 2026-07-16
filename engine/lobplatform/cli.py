@@ -37,91 +37,147 @@ def _repo() -> Repo:
 
 async def _day_scanner(engine: "Engine", stream: "MarketStream",
                        settings: "Settings", tier: "TierConfig") -> None:
-    """Once per session: wait for open + 60s, scan top gainers/most-active,
-    warm up their bar history, expand the engine's live universe, and trigger
-    a stream reconnect so new symbols start receiving bars.
+    """Continuously refresh the trading universe throughout the day.
 
-    Dynamic symbols are session-scoped: engine.day_roll() resets them each
-    morning before the next scan fires.
+    Phase 1 — morning scan (once per calendar day, fires at engine startup):
+        Scores ~3 000 stocks by short-term daily momentum (universe3000.csv →
+        sp500_constituents.csv fallback), warms up minute-bar history for the top
+        candidates, and seeds the live universe before the first bar arrives.
+        Reserves 8 stream slots for intraday screener picks.
+
+    Phase 2 — intraday rescan (every 30 min during market hours):
+        Calls the Alpaca screener for today's top gainers and most-active names.
+        If new candidates appear that aren't already subscribed, idle (no-position)
+        members of the universe are evicted in FIFO order to free slots, then new
+        names are warmed up and added. This catches underdogs that break out mid-day
+        on news, earnings, or sudden volume surges — not just pre-market leaders.
+
+    Stream budget: SUBSCRIPTION_LIMIT = 30.
+    Protected from eviction: tier base universe, any open position symbols.
     """
+    import datetime as dt
+
     from .data import calendar
     from .data.alpaca_stream import SUBSCRIPTION_LIMIT
     from .data.history import fetch_minute_bars
+    from .data.morning_scan import build_daily_candidates
     from .data.screener import scan_candidates
 
-    # One scan slot per session: open + 60s (gap plays, pre-market catalysts).
-    # A midday rescan was considered but dropped: screener picks are gated at
-    # 10:30am ET in _enter_or_adjust (volume collapses on small/mid-caps after
-    # the opening hour), so any new names found later could not enter anyway.
-    SCAN_OFFSETS_S = [60]   # seconds after session open
+    INTRADAY_RESCAN_S = 1800          # rescan screener every 30 min
+    INTRADAY_SLOT_RESERVE = 8         # always keep 8 slots open for intraday picks
 
-    session_open_ts: dict = {}   # date -> aware datetime of session open
-    completed_slots: dict = {}   # date -> set of completed slot indices
+    morning_done: set = set()         # dates where morning scan completed
+    last_intraday_ts = dt.datetime.min.replace(tzinfo=dt.timezone.utc)
+    dynamic_added: list[str] = []     # FIFO queue of dynamically-added symbols
 
     while True:
         await asyncio.sleep(30)
-        dt = __import__("datetime")
         now = dt.datetime.now(dt.timezone.utc)
-        if not calendar.is_session_open(now):
-            continue
         today = now.date()
 
-        if today not in session_open_ts:
-            session_open_ts[today] = now   # approximate open time on first detection
-        if today not in completed_slots:
-            completed_slots[today] = set()
+        # ── Phase 1: morning scan ────────────────────────────────────────────
+        if today not in morning_done:
+            morning_done.add(today)
+            dynamic_added = []   # reset FIFO for the new session
 
-        open_ts = session_open_ts[today]
-        elapsed = (now - open_ts).total_seconds()
+            exclude = set(engine._live_universe)
+            if engine.xsec:
+                exclude |= set(engine.xsec.holdings)
+            slots = max(0, SUBSCRIPTION_LIMIT - len(engine._live_universe)
+                        - INTRADAY_SLOT_RESERVE)
+            if slots > 0:
+                try:
+                    candidates = await asyncio.to_thread(
+                        build_daily_candidates,
+                        settings.alpaca_api_key, settings.alpaca_secret_key,
+                        top_n=slots, exclude=exclude,
+                    )
+                except Exception as exc:
+                    log.warning("day_scanner.morning_failed", error=str(exc))
+                    candidates = []
+                if candidates:
+                    try:
+                        history = await asyncio.to_thread(
+                            fetch_minute_bars,
+                            settings.alpaca_api_key, settings.alpaca_secret_key,
+                            candidates, settings.history_warmup_days,
+                        )
+                        engine.warmup(history)
+                    except Exception as exc:
+                        log.warning("day_scanner.morning_warmup_failed", error=str(exc))
+                    engine.expand_universe(candidates)
+                    dynamic_added.extend(candidates)
+                    engine.state.last_data_ts = dt.datetime.now(dt.timezone.utc)
+                    stream.update_symbols(engine._live_universe)
+                    log.info("day_scanner.morning_done", added=len(candidates),
+                             top5=candidates[:5],
+                             universe=len(engine._live_universe))
 
-        # find the next slot that's due and not yet completed
-        slot_idx = None
-        for i, offset in enumerate(SCAN_OFFSETS_S):
-            if i not in completed_slots[today] and elapsed >= offset:
-                slot_idx = i
-                break
-        if slot_idx is None:
+        # ── Phase 2: intraday rescan ─────────────────────────────────────────
+        if not calendar.is_session_open(now):
             continue
+        if (now - last_intraday_ts).total_seconds() < INTRADAY_RESCAN_S:
+            continue
+        last_intraday_ts = now
 
-        completed_slots[today].add(slot_idx)
-        label = "open" if slot_idx == 0 else "midday"
-
-        # only add symbols not already in the live universe
         exclude = set(engine._live_universe)
-        if engine.xsec:
-            exclude |= set(engine.xsec.holdings)
-        max_n = max(0, SUBSCRIPTION_LIMIT - len(engine._live_universe))
-        if max_n == 0:
-            log.info("day_scanner.slots_full", slot=label)
-            continue
-
         try:
-            candidates = await asyncio.to_thread(
-                scan_candidates, settings.alpaca_api_key, settings.alpaca_secret_key,
-                exclude, max_n,
+            new_candidates = await asyncio.to_thread(
+                scan_candidates,
+                settings.alpaca_api_key, settings.alpaca_secret_key,
+                exclude, 10,
             )
         except Exception as exc:
-            log.warning("day_scanner.scan_failed", slot=label, error=str(exc))
+            log.warning("day_scanner.intraday_failed", error=str(exc))
             continue
 
-        if not candidates:
-            log.info("day_scanner.no_candidates", slot=label)
+        if not new_candidates:
+            log.info("day_scanner.intraday_no_new")
             continue
 
-        try:
-            history = await asyncio.to_thread(
-                fetch_minute_bars, settings.alpaca_api_key, settings.alpaca_secret_key,
-                candidates, settings.history_warmup_days,
-            )
-            engine.warmup(history)
-        except Exception as exc:
-            log.warning("day_scanner.warmup_failed", slot=label, error=str(exc))
-            continue
+        # How many slots do we need to free?
+        slots_free = SUBSCRIPTION_LIMIT - len(engine._live_universe)
+        slots_needed = max(0, len(new_candidates) - slots_free)
 
-        engine.expand_universe(candidates)
+        # Evict oldest idle (no-position) dynamic names to make room
+        held = set(engine.state.positions)
+        evict: list[str] = []
+        if slots_needed > 0:
+            for sym in list(dynamic_added):
+                if sym not in held and sym not in tier.universe:
+                    evict.append(sym)
+                    if len(evict) >= slots_needed:
+                        break
+
+        engine.rotate_universe(new_candidates, evict)
+
+        for sym in evict:
+            if sym in dynamic_added:
+                dynamic_added.remove(sym)
+        dynamic_added.extend(new_candidates)
+
+        # Warm up history only for symbols that were actually added and lack bars
+        actually_added = [s for s in new_candidates
+                          if s in engine._live_universe
+                          and len(engine.bars_5m.get(s, [])) < 30]
+        if actually_added:
+            try:
+                history = await asyncio.to_thread(
+                    fetch_minute_bars,
+                    settings.alpaca_api_key, settings.alpaca_secret_key,
+                    actually_added, settings.history_warmup_days,
+                )
+                engine.warmup(history)
+            except Exception as exc:
+                log.warning("day_scanner.intraday_warmup_failed", error=str(exc))
+
+        # Reset staleness clock before reconnect so the monitor doesn't fire
+        # during the few seconds the stream is tearing down and rebuilding.
+        engine.state.last_data_ts = dt.datetime.now(dt.timezone.utc)
         stream.update_symbols(engine._live_universe)
-        log.info("day_scanner.done", slot=label, added=candidates,
-                 universe_size=len(engine._live_universe))
+        log.info("day_scanner.intraday_done",
+                 added=new_candidates, evicted=evict,
+                 universe=len(engine._live_universe))
 
 
 async def _run(tier_name: str) -> None:

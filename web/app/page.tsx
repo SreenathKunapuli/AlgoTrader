@@ -7,7 +7,7 @@ import EquityChart from "@/components/EquityChart";
 import { KillButton, TierSelector } from "@/components/Controls";
 
 type Account = { equity: number; cash: number; gross_exposure: number; day_pnl: number; day_pnl_pct: number };
-type Status = { status: string; tier: string; halted_reason: string; trading_mode: string };
+type Status = { status: string; tier: string; halted_reason: string; trading_mode: string; heartbeat_age_s: number | null };
 type Position = { symbol: string; qty: number; book: string; entry: number; mark: number; upnl: number; stop: number | null };
 
 const pillColor: Record<string, string> = {
@@ -43,8 +43,24 @@ export default function Dashboard() {
   }, [latest]);
 
   const s = status?.status ?? "…";
+  const hbAge = status?.heartbeat_age_s ?? null;
+  const isStale = hbAge !== null && hbAge > 60;
+
+  function fmtAge(s: number): string {
+    if (s < 60) return `${Math.round(s)}s ago`;
+    if (s < 3600) return `${Math.round(s / 60)}m ago`;
+    return `${(s / 3600).toFixed(1)}h ago`;
+  }
+
   return (
     <main className="mx-auto max-w-6xl space-y-4 p-6">
+      {isStale && (
+        <div className="rounded-lg border border-amber-700 bg-amber-950 px-4 py-2 text-sm text-amber-300">
+          ⚠ Data is stale — last engine heartbeat{" "}
+          <span className="font-semibold">{fmtAge(hbAge!)}</span>.
+          Prices and positions shown are not current. Restart the engine to refresh.
+        </div>
+      )}
       <div className="flex items-center justify-between">
         <h1 className="text-xl font-bold text-white">
           LOB Trading Platform{" "}
@@ -91,8 +107,8 @@ export default function Dashboard() {
               <tr key={p.symbol} className="border-t border-gray-800">
                 <td className="py-2 font-medium">{p.symbol}</td>
                 <td>
-                  <span className={`rounded px-1.5 py-0.5 text-xs font-semibold ${p.book === "xsec" ? "bg-violet-900 text-violet-300" : "bg-sky-900 text-sky-300"}`}>
-                    {p.book === "xsec" ? "Monthly" : "Day Trade"}
+                  <span className="rounded bg-sky-900 px-1.5 py-0.5 text-xs font-semibold text-sky-300">
+                    Day Trade
                   </span>
                 </td>
                 <td>{Math.abs(p.qty)}</td>

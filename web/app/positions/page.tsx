@@ -83,8 +83,8 @@ export default function Positions() {
                   </td>
                   <td>{Math.abs(p.qty)}</td>
                   <td>
-                    <span className={`rounded px-1.5 py-0.5 text-xs font-semibold ${p.book === "xsec" ? "bg-violet-900 text-violet-300" : "bg-sky-900 text-sky-300"}`}>
-                      {p.book === "xsec" ? "Monthly" : "Day Trade"}
+                    <span className="rounded bg-sky-900 px-1.5 py-0.5 text-xs font-semibold text-sky-300">
+                      Day Trade
                     </span>
                   </td>
                   <td>${p.entry?.toFixed(2)}</td>

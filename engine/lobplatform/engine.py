@@ -241,16 +241,30 @@ class Engine:
 
     async def _maybe_exit_on_signal(self, symbol: str, bars: list[Bar],
                                     score: float) -> None:
+        """Exit a position when the ensemble is no longer confident enough to hold it.
+
+        Called only from the `not is_candidate` branch of rebalance(), so score is
+        already below the confidence threshold. We exit on that alone — a weakening
+        but still-positive signal (e.g. 0.3 with threshold 0.45) is not worth holding
+        because the same gate that blocked entry now blocks continued holding.
+        """
         pos = self.state.positions.get(symbol)
         if not pos:
             return
+        threshold = self.tier.confidence_threshold
         if pos.book == "intraday":
-            if (pos.qty > 0 and score <= 0) or (pos.qty < 0 and score >= 0):
+            # Exit longs when not confidently bullish; shorts when not confidently bearish
+            if (pos.qty > 0 and score < threshold) or (pos.qty < 0 and score > -threshold):
                 await self._exit_position(symbol, "signal")
         elif pos.book == "xsec":
-            addon = pos.qty - pos.xsec_qty
-            if addon > 0 and score <= 0:
-                await self._exit_position(symbol, "signal", target_qty=pos.xsec_qty)
+            # Exit the full xsec position (addon + base) when signal falls below threshold.
+            # Clean up the book file so the monthly rebalance doesn't re-enter stale holdings.
+            if score < threshold and pos.qty > 0:
+                log.info("signal.xsec_exit", symbol=symbol, score=round(score, 3))
+                await self._exit_position(symbol, "signal")
+                if self.xsec is not None:
+                    self.xsec.holdings.pop(symbol, None)
+                    self.xsec._save_book()
 
     async def _enter_or_adjust(self, symbol: str, bars: list[Bar],
                                res: Any, now: datetime) -> None:
@@ -275,17 +289,6 @@ class Engine:
         side: Literal["buy", "sell"] = "buy" if delta > 0 else "sell"
 
         is_new_entry = cur_qty == 0 or (cur_qty > 0 and delta > 0) or (cur_qty < 0 and delta < 0)
-
-        # Time gate: screener picks (not base-universe, not xsec) stop accepting new
-        # entries at 10:30am ET — small/mid-cap volume collapses after the opening hour.
-        # xsec holdings are large/mid-cap and liquid all session, so they're exempt.
-        if is_new_entry and not is_xsec and symbol not in self.tier.universe:
-            from zoneinfo import ZoneInfo
-            now_et = now.astimezone(ZoneInfo("America/New_York"))
-            if now_et.hour > 10 or (now_et.hour == 10 and now_et.minute >= 30):
-                log.info("entry.time_gate", symbol=symbol,
-                         now_et=now_et.strftime("%H:%M"))
-                return
 
         # LOB flow directional gate — only for new entries, not exits/adjustments.
         # Only applied when confidence >= lob_flow_min_conf (below that the score is
@@ -423,17 +426,21 @@ class Engine:
         while True:
             await asyncio.sleep(20)
             now = datetime.now(UTC)
-            if self.state.halted or self.tier.name == Tier.LOW:
-                continue  # LOW holds overnight
-            intraday = [s for s in self.state.positions if not self._is_xsec(s)]
-            xsec_addons = [(s, p) for s, p in self.state.positions.items()
-                           if self._is_xsec(s) and p.qty > p.xsec_qty]
-            if calendar.in_eod_flatten_window(now) and (intraday or xsec_addons):
-                log.info("eod.flatten", n=len(intraday), xsec_addons=len(xsec_addons))
-                for sym in intraday:
-                    await self._exit_position(sym, "eod")
-                for sym, p in xsec_addons:
-                    await self._exit_position(sym, "eod", target_qty=p.xsec_qty)
+            if self.state.halted:
+                continue
+            if not calendar.in_eod_flatten_window(now):
+                continue
+            open_positions = [(s, p) for s, p in self.state.positions.items()
+                              if p.qty != 0]
+            if not open_positions:
+                continue
+            log.info("eod.flatten", n=len(open_positions))
+            for sym, _pos in open_positions:
+                await self._exit_position(sym, "eod")
+                if self._is_xsec(sym) and self.xsec is not None:
+                    self.xsec.holdings.pop(sym, None)
+            if self.xsec is not None:
+                self.xsec._save_book()
 
     async def heartbeat(self) -> None:
         last_beat = datetime.now(UTC)
@@ -487,6 +494,11 @@ class Engine:
                     self.state.halted_reason = ""
                     self.repo.update_state(status="RUNNING", halted_reason="")
                     await self.pubsub.publish("engine_status", {"status": "RUNNING"})
+                elif cmd.command == "reset_intraday":
+                    self.state.intraday_halted = False
+                    self.state.last_data_ts = datetime.now(UTC)
+                    self.repo.update_state(status="RUNNING", halted_reason="")
+                    await self.pubsub.publish("engine_status", {"status": "RUNNING"})
                 elif cmd.command == "set_tier":
                     tier_name = str(cmd.payload_json.get("tier", "")).lower()
                     if tier_name in [t.value for t in Tier] and not self.state.halted:
@@ -512,6 +524,30 @@ class Engine:
         self._live_universe.extend(new)
         self.risk.add_to_universe(new)
         log.info("universe.expanded", added=new, total=len(self._live_universe))
+
+    def rotate_universe(self, add: list[str], evict: list[str]) -> None:
+        """Swap stale idle candidates out and fresh ones in.
+
+        Only evicts symbols that have no active position and are not in the
+        hardcoded tier universe — held positions are never touched (we need
+        to keep monitoring them for exits).
+        """
+        protected = (set(self.tier.universe)
+                     | set(self.state.positions)
+                     | (set(self.xsec.holdings) if self.xsec else set()))
+        actual_evict = [s for s in evict if s not in protected]
+        if actual_evict:
+            self._live_universe = [s for s in self._live_universe
+                                   if s not in actual_evict]
+            for s in actual_evict:
+                self.risk._dynamic_universe.discard(s)
+            log.info("universe.evicted", removed=actual_evict,
+                     total=len(self._live_universe))
+        new = [s for s in add if s not in self._live_universe]
+        if new:
+            self._live_universe.extend(new)
+            self.risk.add_to_universe(new)
+            log.info("universe.rotated_in", added=new, total=len(self._live_universe))
 
     async def day_roll(self) -> None:
         """Reset day-start equity at each session open."""

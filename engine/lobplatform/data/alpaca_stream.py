@@ -1,7 +1,7 @@
 """Async Alpaca IEX stream consumer with reconnect + heartbeat.
 
 Free-tier reality: the Basic data plan allows 30 symbol subscriptions per
-connection. Strategy (see DECISIONS.md):
+connection. Strategy (see docs/ARCHITECTURE_DECISIONS.md):
   1. subscribe the official 1-MIN BAR channel for every symbol (N subs) —
      server-built OHLCV, no local bar assembly needed on the live path;
   2. spend the remaining budget on QUOTES (spread/imbalance features),
@@ -103,20 +103,21 @@ class MarketStream:
         from alpaca.data.live import StockDataStream
 
         backoff = 1.0
+        active_stream: Any = None
         while not self._stop.is_set():
             self._reconnect.clear()
             bar_syms, quote_syms, trade_syms = plan_subscriptions(self.symbols)
             try:
-                stream = StockDataStream(self._api_key, self._secret_key)
-                stream.subscribe_bars(self._handle_bar, *bar_syms)
+                active_stream = StockDataStream(self._api_key, self._secret_key)
+                active_stream.subscribe_bars(self._handle_bar, *bar_syms)
                 if quote_syms:
-                    stream.subscribe_quotes(self._handle_quote, *quote_syms)
+                    active_stream.subscribe_quotes(self._handle_quote, *quote_syms)
                 if trade_syms:
-                    stream.subscribe_trades(self._handle_trade, *trade_syms)
+                    active_stream.subscribe_trades(self._handle_trade, *trade_syms)
                 log.info("stream.connect", bars=len(bar_syms),
                          quotes=len(quote_syms), trades=len(trade_syms))
 
-                stream_task = asyncio.ensure_future(stream._run_forever())
+                stream_task = asyncio.ensure_future(active_stream._run_forever())
                 reconnect_task = asyncio.ensure_future(self._reconnect.wait())
                 done, pending = await asyncio.wait(
                     {stream_task, reconnect_task},
@@ -129,10 +130,21 @@ class MarketStream:
                     except (asyncio.CancelledError, Exception):
                         pass
 
+                # Explicitly close the WebSocket so Alpaca releases the connection
+                # slot before we reconnect. Without this explicit close, the server
+                # still sees the old socket alive and the new auth hits "connection
+                # limit exceeded" → data freeze → staleness kill.
+                try:
+                    await active_stream.close()
+                except Exception:
+                    pass
+                active_stream = None
+
                 if reconnect_task in done:
                     log.info("stream.reconnecting", symbols=len(self.symbols))
                     backoff = 1.0
-                    continue  # immediately reconnect with new self.symbols
+                    await asyncio.sleep(1.5)  # let Alpaca server clean up the slot
+                    continue  # reconnect with updated self.symbols
 
                 # stream died unexpectedly — raise its exception for backoff
                 if stream_task in done and not stream_task.cancelled():
@@ -142,6 +154,11 @@ class MarketStream:
                 backoff = 1.0
 
             except asyncio.CancelledError:
+                if active_stream is not None:
+                    try:
+                        await active_stream.close()
+                    except Exception:
+                        pass
                 raise
             except Exception as exc:
                 log.warning("stream.disconnect", error=str(exc), retry_in=backoff)

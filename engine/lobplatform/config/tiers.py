@@ -76,7 +76,7 @@ TIERS: dict[Tier, TierConfig] = {
         max_position_pct=0.05, max_gross_pct=0.40, max_open_positions=6,
         daily_loss_limit_pct=0.01, max_drawdown_pct=0.25, stop_atr_multiple=1.5,
         confidence_threshold=0.55, lob_flow_gate=0.10, lob_flow_min_conf=0.30,
-        rebalance_seconds=86400, risk_per_trade_pct=0.0025,
+        rebalance_seconds=1800, risk_per_trade_pct=0.0025,
         signal_weights={"momentum": 0.7, "mean_reversion": 0.3, "lob_flow": 0.0},
     ),
     Tier.MEDIUM: TierConfig(
