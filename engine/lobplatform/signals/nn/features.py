@@ -2,7 +2,7 @@
 
 Features per finalized 5-min bar, each z-scored over a rolling 60-bar
 window (causal: window ends at the current bar). Feature list is frozen in
-DECISIONS.md. All computations at index i use bars[<=i] only.
+docs/ARCHITECTURE_DECISIONS.md. All computations at index i use bars[<=i] only.
 """
 
 from __future__ import annotations

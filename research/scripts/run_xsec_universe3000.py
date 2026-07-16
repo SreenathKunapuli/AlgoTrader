@@ -2,7 +2,7 @@
 vs distilled student, on ~3000 liquid US stocks with point-in-time top-2000
 eligibility. The scoreboard is one cost-aware portfolio and rank IC.
 
-Usage: python -m research.scripts.run_xsec2  (after fetch_universe.py)
+Usage: python -m research.scripts.run_xsec_universe3000  (after fetch_universe.py)
 """
 
 from __future__ import annotations

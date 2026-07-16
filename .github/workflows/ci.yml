@@ -11,3 +11,11 @@ jobs:
       - run: ruff check engine api
       - run: mypy
       - run: pytest engine/tests api/tests -q
+  research:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.11"}
+      - run: pip install -r research/requirements.txt
+      - run: pytest research/tests -q

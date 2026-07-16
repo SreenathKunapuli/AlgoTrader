@@ -1,28 +1,40 @@
+# Python
 .venv/
 __pycache__/
 *.pyc
-.pytest_cache/
-.env
-data/*.csv
-research/data/*.csv
-runs/
-research/runs/
-logs/
-models/*.pt
-node_modules/
-.next/
 *.egg-info/
+.pytest_cache/
 .mypy_cache/
 .ruff_cache/
-web/out/
-data_holdout/
-node_modules/
-.next/
-test-results/
-playwright-report/
+.hypothesis/
+
+# Secrets / local config
+.env
+Makefile.local
+.claude/
+
+# Runtime artifacts
 lobplatform.db
 lobengine.pid
+logs/
+
+# Data & model artifacts (regeneratable; see README)
+data/*.csv
+!data/sp500_constituents.csv
+!data/universe3000.csv
 data/*.pkl
 data/xsec_book.json
 data/xsec_results/
-Makefile.local
+data_holdout/
+research/data/*.csv
+runs/
+research/runs/
+models/*.pt
+models/*.pkl
+
+# Web
+node_modules/
+.next/
+web/out/
+test-results/
+playwright-report/

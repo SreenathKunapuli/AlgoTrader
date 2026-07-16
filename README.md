@@ -87,7 +87,7 @@ web/        Next.js 14 dashboard (login, dashboard, trades, signals,
 Login (password → httpOnly JWT cookie) → dashboard: equity curve (live via
 WebSocket), day P&L, positions with stops, engine status pill, tier
 selector with confirm dialog, and a kill switch that requires typing
-`FLATTEN`. *(screenshot placeholder)*
+`FLATTEN`.
 
 ## Testing
 
@@ -107,3 +107,7 @@ the project plan but intentionally not implemented until Phases 1–3 are
 accepted in real paper sessions. Managing other people's money requires
 registration (RIA/broker-dealer); this project stays permanently on the
 self-directed side of that line.
+
+## License
+
+Apache 2.0 — see [LICENSE](LICENSE).
