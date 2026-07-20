@@ -9,6 +9,7 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+from alpaca.data.enums import Adjustment, DataFeed
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
@@ -33,7 +34,7 @@ def fetch_daily_history(
     for i in range(0, len(symbols), 200):
         chunk = symbols[i: i + 200]
         req = StockBarsRequest(symbol_or_symbols=chunk, timeframe=TimeFrame.Day,
-                               start=start, end=end, adjustment="all", feed="sip")
+                               start=start, end=end, adjustment=Adjustment.ALL, feed=DataFeed.SIP)
         resp: Any = client.get_stock_bars(req)
         for sym in chunk:
             bars = resp.data.get(sym, [])
@@ -55,7 +56,7 @@ def fetch_latest_closes(
     end = datetime.now(UTC) - timedelta(minutes=16)
     req = StockBarsRequest(symbol_or_symbols=symbols, timeframe=TimeFrame.Day,
                            start=end - timedelta(days=7), end=end,
-                           adjustment="all", feed="sip")
+                           adjustment=Adjustment.ALL, feed=DataFeed.SIP)
     resp: Any = client.get_stock_bars(req)
     return {s: float(resp.data[s][-1].close) for s in symbols if resp.data.get(s)}
 
@@ -79,7 +80,7 @@ def fetch_latest_quotes(
     out: dict[str, tuple[float, float]] = {}
     for i in range(0, len(symbols), 200):
         chunk = symbols[i: i + 200]
-        req = StockLatestQuoteRequest(symbol_or_symbols=chunk, feed="iex")
+        req = StockLatestQuoteRequest(symbol_or_symbols=chunk, feed=DataFeed.IEX)
         quotes: Any = client.get_stock_latest_quote(req)
         for sym in chunk:
             q = quotes.get(sym)

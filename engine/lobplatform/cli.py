@@ -17,6 +17,10 @@ import structlog
 from .config.settings import get_settings
 
 if TYPE_CHECKING:
+    from .config.settings import Settings
+    from .config.tiers import TierConfig
+    from .data.alpaca_stream import MarketStream
+    from .engine import Engine
     from .persistence.repo import Repo
 from .config.tiers import TIERS, Tier
 
@@ -35,8 +39,8 @@ def _repo() -> Repo:
     return Repo(s.resolved_database_url())
 
 
-async def _day_scanner(engine: "Engine", stream: "MarketStream",
-                       settings: "Settings", tier: "TierConfig") -> None:
+async def _day_scanner(engine: Engine, stream: MarketStream,
+                       settings: Settings, tier: TierConfig) -> None:
     """Continuously refresh the trading universe throughout the day.
 
     Phase 1 — morning scan (once per calendar day, fires at engine startup):
@@ -66,17 +70,22 @@ async def _day_scanner(engine: "Engine", stream: "MarketStream",
     INTRADAY_RESCAN_S = 1800          # rescan screener every 30 min
     INTRADAY_SLOT_RESERVE = 8         # always keep 8 slots open for intraday picks
 
-    morning_done: set = set()         # dates where morning scan completed
-    last_intraday_ts = dt.datetime.min.replace(tzinfo=dt.timezone.utc)
+    morning_done: set[dt.date] = set()  # dates where morning scan completed
+    last_intraday_ts = dt.datetime.min.replace(tzinfo=dt.UTC)
     dynamic_added: list[str] = []     # FIFO queue of dynamically-added symbols
 
     while True:
         await asyncio.sleep(30)
-        now = dt.datetime.now(dt.timezone.utc)
+        now = dt.datetime.now(dt.UTC)
         today = now.date()
 
         # ── Phase 1: morning scan ────────────────────────────────────────────
-        if today not in morning_done:
+        # Wait for the session to open AND for the engine's day_roll to have
+        # reset the universe. Running earlier (the loop wakes at midnight UTC
+        # when the calendar date flips) gets its additions wiped by that reset.
+        if (today not in morning_done
+                and calendar.is_session_open(now)
+                and engine.day_rolled_date == today):
             morning_done.add(today)
             dynamic_added = []   # reset FIFO for the new session
 
@@ -107,7 +116,7 @@ async def _day_scanner(engine: "Engine", stream: "MarketStream",
                         log.warning("day_scanner.morning_warmup_failed", error=str(exc))
                     engine.expand_universe(candidates)
                     dynamic_added.extend(candidates)
-                    engine.state.last_data_ts = dt.datetime.now(dt.timezone.utc)
+                    engine.state.last_data_ts = dt.datetime.now(dt.UTC)
                     stream.update_symbols(engine._live_universe)
                     log.info("day_scanner.morning_done", added=len(candidates),
                              top5=candidates[:5],
@@ -173,7 +182,7 @@ async def _day_scanner(engine: "Engine", stream: "MarketStream",
 
         # Reset staleness clock before reconnect so the monitor doesn't fire
         # during the few seconds the stream is tearing down and rebuilding.
-        engine.state.last_data_ts = dt.datetime.now(dt.timezone.utc)
+        engine.state.last_data_ts = dt.datetime.now(dt.UTC)
         stream.update_symbols(engine._live_universe)
         log.info("day_scanner.intraday_done",
                  added=new_candidates, evicted=evict,

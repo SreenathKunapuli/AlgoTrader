@@ -31,7 +31,7 @@ and permanently out of scope).
 ```bash
 make setup                      # venv + deps
 cp .env.example .env            # add your Alpaca PAPER keys + APP_PASSWORD
-make test                       # 48 python tests
+make test                       # 87 python tests (engine + api)
 make run-engine                 # lobctl run --tier medium
 make run-api                    # FastAPI on :8000 (docs at /docs)
 make run-web                    # Next.js on :3000
@@ -69,7 +69,7 @@ one-shot holdout). Live shadow evaluation halves a signal's ensemble
 weight when its rolling 20-session performance degrades.
 
 The original 10-level LOBSTER research remains intact in `research/`
-(31 tests) as the offline research track.
+(43 tests) as the offline research track.
 
 ## Repo layout
 
@@ -91,12 +91,16 @@ selector with confirm dialog, and a kill switch that requires typing
 
 ## Testing
 
-- `make test` — 48 tests: sizing property tests, 100% branch coverage of
+- `make test` — 87 tests: sizing property tests, 100% branch coverage of
   risk rejections, kill-switch sequence, bar-builder correctness, NN port
   suite (shape/causality/overfit/focal/TorchScript/leakage), replay
-  integration with a MockBroker, full API surface + WS + metrics goldens.
+  integration with a MockBroker (incl. stop/exit race regressions), full
+  API surface + WS + metrics goldens.
+- `make test-research` — 43 research-track tests (leakage, simulator,
+  backtest math, xsec pipeline).
 - `cd web && npx playwright test` — E2E smoke.
 - CI: `.github/workflows/ci.yml` (ruff, mypy, pytest).
+- Deployment: see [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
 
 ## Going live (not built)
 

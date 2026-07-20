@@ -14,7 +14,7 @@ from lobplatform.engine import Engine
 from lobplatform.execution.order_manager import OrderManager
 from lobplatform.pubsub import PubSub
 from lobplatform.risk.state import PortfolioState, Position
-from lobplatform.signals.ensemble import Ensemble
+from lobplatform.signals.ensemble import Ensemble, EnsembleResult
 from lobplatform.signals.mean_reversion import MeanReversionSignal
 from lobplatform.signals.momentum import MomentumSignal
 
@@ -151,3 +151,56 @@ async def test_trailing_stop_advances_and_locks_gain(state, repo, mock_broker) -
 
     await engine.rebalance(now)
     assert state.positions["AAPL"].stop_price >= new_stop, "stop must never retreat"
+
+
+async def test_scale_down_keeps_long_stop(state, repo, mock_broker) -> None:  # type: ignore[no-untyped-def]
+    """Reducing a long must not restage its stop from the ORDER side: a
+    scale-down sell once wrote a short-style stop above price, which stopped
+    the remainder out on the next bar."""
+    engine, om = make_engine(state, repo, mock_broker)
+    for b in make_flat_bars("AAPL", 40, SESSION_OPEN, price=108.0):
+        engine.bars_5m["AAPL"].append(b)
+    state.positions["AAPL"] = Position(symbol="AAPL", qty=50, entry_price=100.0,
+                                       mark=108.0, stop_price=97.0)
+    mock_broker.positions["AAPL"] = 50
+    # strong long signal but tiny vol multiplier -> target far below current qty
+    res = EnsembleResult(symbol="AAPL", final_score=0.6, vol_mult=0.05)
+    await engine._enter_or_adjust("AAPL", list(engine.bars_5m["AAPL"]), res,
+                                  SESSION_OPEN + timedelta(hours=2))
+    sells = [o for o in mock_broker.submitted if o.side == "sell"]
+    assert sells, "expected a scale-down sell"
+    assert state.positions["AAPL"].stop_price == 97.0, "scale-down must not touch the stop"
+    assert "AAPL" not in engine._pending_stops
+
+
+async def test_exit_inflight_guard_prevents_stacked_exits(state, repo, mock_broker) -> None:  # type: ignore[no-untyped-def]
+    """Stop/EOD checks re-fire before the exit ladder fills; a second exit
+    order filling alongside the first would flip the position."""
+    engine, om = make_engine(state, repo, mock_broker)
+    state.positions["SPY"] = Position(symbol="SPY", qty=10, entry_price=100.0,
+                                      mark=100.0, stop_price=99.0)
+    mock_broker.positions["SPY"] = 10
+    await engine._exit_position("SPY", "stop")
+    await engine._exit_position("SPY", "stop")
+    sells = [o for o in mock_broker.submitted if o.symbol == "SPY" and o.side == "sell"]
+    assert len(sells) == 1, "duplicate exit while one is in flight"
+
+
+async def test_intraday_kill_flattens_addon_keeps_xsec_base(state, repo, mock_broker) -> None:  # type: ignore[no-untyped-def]
+    engine, om = make_engine(state, repo, mock_broker)
+    state.positions["NVDA"] = Position(symbol="NVDA", qty=15, entry_price=100.0,
+                                       mark=100.0, book="xsec", xsec_qty=10)
+    mock_broker.positions["NVDA"] = 15
+    await engine._flatten_intraday("test")
+    sells = [o for o in mock_broker.submitted if o.symbol == "NVDA" and o.side == "sell"]
+    assert len(sells) == 1 and sells[0].qty == 5, "only the addon layer is intraday exposure"
+
+
+async def test_signal_exit_spares_xsec_base(state, repo, mock_broker) -> None:  # type: ignore[no-untyped-def]
+    """A dead 5-min ensemble score must not liquidate the monthly xsec base."""
+    engine, om = make_engine(state, repo, mock_broker)
+    state.positions["NVDA"] = Position(symbol="NVDA", qty=10, entry_price=100.0,
+                                       mark=100.0, book="xsec", xsec_qty=10)
+    mock_broker.positions["NVDA"] = 10
+    await engine._maybe_exit_on_signal("NVDA", [], 0.0)
+    assert not mock_broker.submitted

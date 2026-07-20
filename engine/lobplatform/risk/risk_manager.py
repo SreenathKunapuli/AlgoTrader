@@ -152,7 +152,8 @@ class RiskManager:
                 else:
                     if (cur_qty + delta) < 0 and not t.allow_short:
                         return Rejection(intent, "shorting not allowed in this tier")
-                    if self._post_trade_position_value(intent) > t.max_position_pct * s.equity + 1e-6:
+                    if (self._post_trade_position_value(intent)
+                            > t.max_position_pct * s.equity + 1e-6):
                         return Rejection(intent, "exceeds max position size")
                     if self._post_trade_gross(intent) > t.max_gross_pct * s.equity + 1e-6:
                         return Rejection(intent, "exceeds max gross exposure")

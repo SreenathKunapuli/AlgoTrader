@@ -38,6 +38,7 @@ class MockBroker:
         self.open_orders: list[BrokerOrder] = []
         self.submitted: list[BrokerOrder] = []
         self.cancelled: list[str] = []
+        self._cancelled_orders: dict[str, BrokerOrder] = {}
         self.closed_all = 0
         self._next = 0
 
@@ -74,7 +75,21 @@ class MockBroker:
 
     async def cancel_order(self, order_id: str) -> None:
         self.cancelled.append(order_id)
+        for o in self.open_orders:
+            if o.id == order_id:
+                self._cancelled_orders[order_id] = BrokerOrder(
+                    id=o.id, client_order_id=o.client_order_id, symbol=o.symbol,
+                    side=o.side, qty=o.qty, status="canceled",
+                    filled_qty=o.filled_qty, filled_avg_price=o.filled_avg_price)
         self.open_orders = [o for o in self.open_orders if o.id != order_id]
+
+    async def get_order(self, order_id: str) -> BrokerOrder:
+        if order_id in self._cancelled_orders:
+            return self._cancelled_orders[order_id]
+        for o in self.submitted + self.open_orders:
+            if o.id == order_id:
+                return o
+        raise KeyError(order_id)
 
     async def close_position(self, symbol: str) -> None:
         self.positions.pop(symbol, None)

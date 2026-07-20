@@ -124,7 +124,8 @@ def test_xsec_long_only_and_cross_book_lock():
     # Intraday LONG add-on on an xsec long position is now allowed
     intraday_long = OrderIntent(symbol="AAPL", side="buy", qty=5, price_hint=100.0)
     r2 = risk.approve(intraday_long, ENTRY_TS)
-    assert not isinstance(r2, Rejection), f"expected approval, got: {r2.reason if isinstance(r2, Rejection) else ''}"
+    assert not isinstance(r2, Rejection), (
+        f"expected approval, got: {r2.reason if isinstance(r2, Rejection) else ''}")
 
     # Intraday SHORT on an xsec position must still be rejected (cross-book conflict)
     intraday_short = OrderIntent(symbol="AAPL", side="sell", qty=5, price_hint=100.0)

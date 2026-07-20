@@ -14,6 +14,7 @@ Each item contains at minimum: symbol, price, percent_change, volume.
 from __future__ import annotations
 
 import re
+from typing import Any
 
 import requests
 import structlog
@@ -25,7 +26,7 @@ _VALID_SYM = re.compile(r"^[A-Z]{1,5}$")   # plain US equity tickers only
 
 
 def _get(path: str, api_key: str, secret_key: str,
-         params: dict | None = None) -> dict:
+         params: dict[str, Any] | None = None) -> dict[str, Any]:
     r = requests.get(
         f"{_BASE}/{path}",
         headers={"APCA-API-KEY-ID": api_key, "APCA-API-SECRET-KEY": secret_key},
@@ -33,7 +34,8 @@ def _get(path: str, api_key: str, secret_key: str,
         timeout=10,
     )
     r.raise_for_status()
-    return r.json()
+    data: dict[str, Any] = r.json()
+    return data
 
 
 def scan_candidates(
@@ -58,8 +60,8 @@ def scan_candidates(
       - for gainers: pct_change >= min_pct_change (default +3% — real catalyst)
     Either endpoint failing is tolerated; the other still contributes.
     """
-    gainers_raw: list[dict] = []
-    actives_raw: list[dict] = []
+    gainers_raw: list[dict[str, Any]] = []
+    actives_raw: list[dict[str, Any]] = []
     try:
         data = _get("movers", api_key, secret_key, params={"top": 25})
         gainers_raw = data.get("gainers", [])
@@ -72,10 +74,10 @@ def scan_candidates(
     except Exception as exc:
         log.warning("screener.actives_failed", error=str(exc))
 
-    scored: list[tuple[float, dict]] = []
+    scored: list[tuple[float, dict[str, Any]]] = []
     seen_sym: set[str] = set()
 
-    def _score(item: dict, require_pct: bool) -> float | None:
+    def _score(item: dict[str, Any], require_pct: bool) -> float | None:
         sym = str(item.get("symbol", ""))
         price = float(item.get("price", 0) or 0)
         volume = float(item.get("volume", 0) or 0)
@@ -88,7 +90,7 @@ def scan_candidates(
             return None
         if require_pct and pct < min_pct_change:
             return None
-        return (pct * dv) ** 0.5   # geometric mean: rewards both momentum and liquidity
+        return float((pct * dv) ** 0.5)   # geometric mean: momentum and liquidity
 
     for item in gainers_raw:
         s = _score(item, require_pct=True)

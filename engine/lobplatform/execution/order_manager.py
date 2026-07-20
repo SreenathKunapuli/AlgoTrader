@@ -101,8 +101,10 @@ class OrderManager:
             live = await self._find_open(order.id)
             if live is None:
                 return  # filled or already cancelled
-            await self._broker.cancel_order(order.id)
-            remaining = live.qty - live.filled_qty
+            settled = await self._cancel_and_settle(order.id)
+            if settled is None or settled.status == "filled":
+                return  # filled during the cancel race, or state unknown
+            remaining = settled.qty - settled.filled_qty
             if remaining <= 0:
                 return
             coid = f"{order.client_order_id[:24]}-rp"
@@ -135,14 +137,46 @@ class OrderManager:
         open_orders = await self._broker.get_open_orders()
         return next((o for o in open_orders if o.id == order_id), None)
 
+    _TERMINAL = frozenset({"filled", "canceled", "cancelled", "expired",
+                           "rejected", "done_for_day", "stopped"})
+
+    async def _cancel_and_settle(self, order_id: str) -> BrokerOrder | None:
+        """Cancel an order and poll it to a TERMINAL state before replacing.
+
+        Broker cancels are asynchronous: 'cancel accepted' does not mean
+        'cancelled' — the order can still fill after the request. Computing
+        the replacement qty from a pre-cancel snapshot double-executes when
+        that race is lost (observed live 2026-07-16: 200-share exit filled
+        AND its market replacement filled → unintended 200-share short).
+        Returns the settled order, or None if it never settled (caller must
+        NOT replace in that case — better unfilled than doubled)."""
+        try:
+            await self._broker.cancel_order(order_id)
+        except Exception as exc:
+            log.info("order.cancel_rejected", order_id=order_id, error=str(exc))
+        for _ in range(10):
+            try:
+                o = await self._broker.get_order(order_id)
+            except Exception as exc:
+                log.warning("order.settle_poll_failed", order_id=order_id,
+                            error=str(exc))
+                return None
+            if o.status in self._TERMINAL:
+                return o
+            await asyncio.sleep(0.5)
+        log.warning("order.settle_timeout", order_id=order_id)
+        return None
+
     async def _replace_if_unfilled(self, order: BrokerOrder, reason: str) -> None:
         """Cancel-replace as market if the limit hasn't fully filled in 30s."""
         try:
             live = await self._find_open(order.id)
             if live is None:
                 return  # filled or already cancelled
-            await self._broker.cancel_order(order.id)
-            remaining = live.qty - live.filled_qty
+            settled = await self._cancel_and_settle(order.id)
+            if settled is None or settled.status == "filled":
+                return  # filled during the cancel race, or state unknown
+            remaining = settled.qty - settled.filled_qty
             if remaining <= 0:
                 return
             coid = f"{order.client_order_id[:24]}-mkt"
@@ -186,6 +220,12 @@ class OrderManager:
                                 pnl=pnl, signal_scores_json=pos.entry_signals)
         if new_qty == 0:
             del self.state.positions[symbol]
+        elif closing and (new_qty > 0) != (pos.qty > 0):
+            # crossed through zero: the remainder is a NEW position at this
+            # fill price, not a continuation of the old entry
+            self.state.positions[symbol] = Position(
+                symbol=symbol, qty=new_qty, entry_price=price, mark=price,
+                entry_ts=now, entry_signals=signals or {}, book=book)
         else:
             pos.qty = new_qty
             pos.mark = price

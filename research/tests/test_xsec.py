@@ -11,8 +11,8 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from research.xsec import backtest as bt
-from research.xsec import features as ft
+from xsec import backtest as bt
+from xsec import features as ft
 
 
 def make_panel(n_days: int = 400, n_syms: int = 12, seed: int = 7):
@@ -153,7 +153,7 @@ def test_information_coefficient_perfect_and_inverted():
 
 def test_sentiment_student_roundtrip(tmp_path):
     import pandas as pd
-    from research.xsec.sentiment import score_headlines, train_student
+    from xsec.sentiment import score_headlines, train_student
     rows = []
     for i in range(40):
         rows.append({"headline": f"Company{i} Q{i%4} EPS Beats Estimate, Sales Beat", "label": 1})
@@ -170,7 +170,7 @@ def test_sentiment_student_roundtrip(tmp_path):
 
 
 def test_distilled_student_tracks_teacher():
-    from research.xsec.models import DistilledStudent, TeacherEnsemble
+    from xsec.models import DistilledStudent, TeacherEnsemble
     rng = np.random.default_rng(2)
     x = rng.uniform(0, 1, (2000, len(ft.FEATURES)))
     y = (0.6 * x[:, 0] - 0.4 * x[:, 3] + rng.normal(0, 0.1, 2000))

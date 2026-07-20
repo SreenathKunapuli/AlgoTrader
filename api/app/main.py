@@ -27,7 +27,14 @@ from lobplatform.persistence.repo import Repo
 from pydantic import BaseModel
 from sqlalchemy import select
 
-from .auth import check_login_rate, decode_token, issue_guest_token, issue_token, require_auth, require_owner
+from .auth import (
+    check_login_rate,
+    decode_token,
+    issue_guest_token,
+    issue_token,
+    require_auth,
+    require_owner,
+)
 from .metrics import compute_metrics, downsample
 
 settings = get_settings()

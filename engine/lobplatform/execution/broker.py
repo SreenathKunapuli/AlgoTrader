@@ -130,6 +130,10 @@ class AlpacaBroker:
     async def cancel_order(self, order_id: str) -> None:
         await self._call(self._client.cancel_order_by_id, order_id)
 
+    async def get_order(self, order_id: str) -> BrokerOrder:
+        o = await self._call(self._client.get_order_by_id, order_id)
+        return self._map_order(o)
+
     async def close_position(self, symbol: str) -> None:
         await self._call(self._client.close_position, symbol)
 
