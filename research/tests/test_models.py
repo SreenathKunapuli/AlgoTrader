@@ -23,16 +23,24 @@ def test_tcn_forward():
 
 
 def test_tcn_causality():
-    """Future inputs must not change current output."""
+    """Perturbing future timesteps must not change earlier outputs."""
     torch.manual_seed(0)
     m = TCN(n_features=8, channels=(16, 16, 16)).eval()
     x = torch.randn(1, 50, 8)
+    x2 = x.clone()
+    x2[:, 30:] = 999.0                        # perturb the future
     with torch.no_grad():
-        base = m(x[:, :30])
-        x2 = x.clone()
-        x2[:, 30:] = 999.0          # perturb the future
-        pert = m(x2[:, :30])        # same first-30 window
-    torch.testing.assert_close(base, pert)
+        feats = m.tcn(x.permute(0, 2, 1))     # [B, C, T]
+        feats2 = m.tcn(x2.permute(0, 2, 1))
+        prefix = m(x[:, :30])                 # prediction seeing data up to t=30
+        full_at_30 = m.head(feats2[:, :, 29]) # same timestep, perturbed future
+    # The perturbation must actually reach the network (guards against a
+    # vacuous test) ...
+    assert not torch.allclose(feats[:, :, 30:], feats2[:, :, 30:])
+    # ... yet features before the perturbation point are untouched, and the
+    # t=30 prediction is identical whether the perturbed future exists or not.
+    torch.testing.assert_close(feats[:, :, :30], feats2[:, :, :30])
+    torch.testing.assert_close(prefix, full_at_30)
 
 
 def test_build_model_guards():
